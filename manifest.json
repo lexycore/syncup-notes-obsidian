@@ -1,0 +1,9 @@
+{
+	"id": "syncup-notes",
+	"name": "SyncUp Notes",
+	"version": "0.1.0",
+	"minAppVersion": "1.5.0",
+	"description": "Sync an Obsidian vault with SyncUp Notes.",
+	"author": "SyncUp",
+	"isDesktopOnly": false
+}
