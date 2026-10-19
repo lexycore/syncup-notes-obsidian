@@ -1,4 +1,4 @@
-import { AuthError, QuotaError, TooLargeError, cleanEtag } from "./webdav.ts";
+import { AuthError, QuotaError, TooLargeError, cleanEtag, limitBytes } from "./webdav.ts";
 
 declare function require(id: string): unknown;
 
@@ -103,7 +103,7 @@ export function streamDownload(modules: NodeModules, dest: string, partial: stri
 	const client = target.protocol === "https:" ? modules.https : modules.http;
 	return new Promise<string>((resolve, reject) => {
 		const req = client.request(target, { method: "GET", headers }, (res) => {
-			const failed = statusError(res.statusCode ?? 0);
+			const failed = statusError(res.statusCode ?? 0, res.headers);
 			if (failed) {
 				res.resume();
 				reject(failed);
@@ -134,7 +134,7 @@ export function streamDownload(modules: NodeModules, dest: string, partial: stri
 }
 
 function settle(res: Incoming, resolve: (etag: string) => void, reject: (error: Error) => void): void {
-	const failed = statusError(res.statusCode ?? 0);
+	const failed = statusError(res.statusCode ?? 0, res.headers);
 	res.on("error", reject);
 	res.on("end", () => {
 		if (failed) reject(failed);
@@ -143,10 +143,10 @@ function settle(res: Incoming, resolve: (etag: string) => void, reject: (error: 
 	res.resume();
 }
 
-function statusError(status: number): Error | null {
+function statusError(status: number, headers?: Record<string, string | string[] | undefined>): Error | null {
 	if (status === 401 || status === 403) return new AuthError();
 	if (status === 507) return new QuotaError();
-	if (status === 413) return new TooLargeError();
+	if (status === 413) return new TooLargeError(limitBytes(oneHeader(headers ?? {}, "x-syncup-file-limit")));
 	if (status >= 400) return new Error(`webdav ${status}`);
 	return null;
 }

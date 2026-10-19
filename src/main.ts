@@ -6,7 +6,7 @@ interface ExplorerItem {
 	setCollapsed?(collapsed: boolean): void;
 }
 import { parentFolders } from "./folders";
-import { deleteCount, pathsDiffer, planSync, type BaselineEntry, type LocalFile } from "./plan";
+import { deleteCount, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
 import { desktopModules, partialFile, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
 import { execute, type SyncIO, type SyncProgress } from "./sync";
@@ -112,14 +112,15 @@ export default class SyncUpNotesPlugin extends Plugin {
 	private async syncVault(): Promise<boolean> {
 		this.setStatus("SyncUp · listing");
 		const dav = new WebDav((request) => this.http(request), this.settings);
-		const remote = await dav.list();
+		const listing = await dav.list();
+		const remote = listing.files;
 		const local = this.localFiles();
 		if (pathsDiffer(local, remote)) {
 			this.setStatus("SyncUp · paths differ");
 			new Notice("SyncUp Notes: this vault and the server folder don't match, so nothing was changed.");
 			return false;
 		}
-		const actions = planSync({ local, remote, baseline: this.settings.baseline, allowLarge: this.settings.allowLargeFiles });
+		const actions = planSync({ local, remote, baseline: this.settings.baseline, fileLimit: listing.fileLimit });
 		const deletes = deleteCount(actions);
 		if (deletes > 25) {
 			this.setStatus(`SyncUp · held ${deletes} deletes`);
@@ -140,13 +141,17 @@ export default class SyncUpNotesPlugin extends Plugin {
 			new Notice("SyncUp Notes: storage is full");
 			return true;
 		}
+		if (result.skipped.length > 0) {
+			const limit = result.fileLimit ?? listing.fileLimit;
+			new Notice(`SyncUp Notes: ${overLimitNotice(result.skipped, limit)}`);
+		}
 		if (result.errors.length > 0) {
 			this.setStatus("SyncUp · failed");
 			new Notice(`SyncUp Notes: ${result.errors[0]}`);
 			return true;
 		}
 		if (result.skipped.length > 0) {
-			this.setStatus(`SyncUp · skipped ${result.skipped.length} large`);
+			this.setStatus(`SyncUp · ${result.skipped.length} over the file limit`);
 			return true;
 		}
 		this.setStatus("SyncUp · up to date");

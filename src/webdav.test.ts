@@ -35,8 +35,9 @@ test("list sends one infinity propfind with basic auth", async () => {
 		seen.push({ method: request.method, url: request.url, headers: request.headers });
 		return text(207, xml);
 	}, { server: "https://syncup.ru/webdav/", folder: "alkov", username: "a@b.c", password: "secret" });
-	const files = await dav.list();
-	assert.equal(files.length, 1);
+	const listing = await dav.list();
+	assert.equal(listing.files.length, 1);
+	assert.equal(listing.fileLimit, undefined);
 	assert.equal(seen[0].method, "PROPFIND");
 	assert.equal(seen[0].url, "https://syncup.ru/webdav/alkov/");
 	assert.equal(seen[0].headers.Depth, "infinity");
@@ -69,8 +70,16 @@ test("auth, quota, and size errors are distinct", async () => {
 	await assert.rejects(dav(401).list(), AuthError);
 	await assert.rejects(dav(507).put("a.md", new Uint8Array([1])), QuotaError);
 	await assert.rejects(dav(413).put("a.md", new Uint8Array([1])), TooLargeError);
+	const limited = new WebDav(async () => text(413, "too large", { "x-syncup-file-limit": "2147483648" }), {
+		server: "https://syncup.ru/webdav", folder: "", username: "a@b.c", password: "s",
+	});
+	await assert.rejects(limited.put("clip.mp4", new Uint8Array([1])), (error: unknown) => {
+		assert.ok(error instanceof TooLargeError);
+		assert.equal(error.limit, 2 * 1024 * 1024 * 1024);
+		return true;
+	});
 });
 
-function text(status: number, body: string): HttpResponse {
-	return { status, headers: {}, body: new TextEncoder().encode(body) };
+function text(status: number, body: string, headers: Record<string, string> = {}): HttpResponse {
+	return { status, headers, body: new TextEncoder().encode(body) };
 }

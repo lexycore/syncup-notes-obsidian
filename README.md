@@ -2,7 +2,7 @@
 
 Obsidian plugin that syncs a vault with [SyncUp](https://syncup.ru) over WebDAV. The id is `syncup-notes`.
 
-Files in `.obsidian`, `.git`, and `node_modules` stay on the device. A file larger than 64 MB is skipped unless Sync large files is on. On desktop those files stream from disk, so Obsidian is not holding the whole file in memory. Sync runs while Obsidian is open: on startup, about two seconds after a save, and once a minute.
+Files in `.obsidian`, `.git`, and `node_modules` stay on the device. A file is uploaded when it fits the file size on the SyncUp plan. A larger file stays where it is, and Obsidian says which limit it passed. On desktop those files stream from disk, so Obsidian is not holding the whole file in memory. Sync runs while Obsidian is open: on startup, about two seconds after a save, and once a minute.
 
 The open note and expanded folders are stored in `.syncup/view.json` and shared with the SyncUp Notes page. That folder is hidden in the file explorer. The web page picks up vault changes within a few seconds. Obsidian picks up a change made on the web on the next sync.
 

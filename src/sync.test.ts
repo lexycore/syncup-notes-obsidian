@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
 import { execute, type SyncIO } from "./sync.ts";
-import { QuotaError } from "./webdav.ts";
+import { QuotaError, TooLargeError } from "./webdav.ts";
 
 test("an upload records the server etag and the local mtime", async () => {
 	const baseline: Record<string, BaselineEntry> = {};
@@ -75,6 +75,29 @@ test("a full storage error keeps files already uploaded", async () => {
 	assert.equal(result.abort, "quota");
 	assert.equal(result.baseline["a.md"].etag, "ok");
 	assert.equal(result.baseline["c.md"], undefined);
+});
+
+test("a file over the plan limit is skipped and the next file still uploads", async () => {
+	const io = fake({
+		streamPut: async (path) => {
+			if (path === "talk.mp4") throw new TooLargeError(512 * 1024 * 1024);
+			return { etag: "stream" };
+		},
+		put: async () => ({ etag: "ok" }),
+		stat: async () => ({ size: 2, mtime: 3 }),
+	});
+	const result = await execute(
+		[
+			{ type: "upload", path: "talk.mp4", size: 732 * 1024 * 1024 },
+			{ type: "upload", path: "ok.md", size: 2 },
+		],
+		io,
+		{},
+	);
+	assert.deepEqual(result.skipped, ["talk.mp4"]);
+	assert.equal(result.fileLimit, 512 * 1024 * 1024);
+	assert.equal(result.baseline["ok.md"].etag, "ok");
+	assert.equal(result.errors.length, 0);
 });
 
 function fake(impl: Partial<SyncIO>): SyncIO {

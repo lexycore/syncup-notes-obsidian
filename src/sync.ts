@@ -1,5 +1,5 @@
 import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
-import { AuthError, QuotaError } from "./webdav.ts";
+import { AuthError, QuotaError, TooLargeError } from "./webdav.ts";
 
 export interface SyncIO {
 	read(path: string): Promise<Uint8Array>;
@@ -24,10 +24,17 @@ export async function execute(
 	io: SyncIO,
 	baseline: Record<string, BaselineEntry>,
 	progress?: (update: SyncProgress) => void,
-): Promise<{ baseline: Record<string, BaselineEntry>; skipped: string[]; errors: string[]; abort?: "auth" | "quota" }> {
+): Promise<{
+	baseline: Record<string, BaselineEntry>;
+	skipped: string[];
+	errors: string[];
+	fileLimit?: number;
+	abort?: "auth" | "quota";
+}> {
 	const next = { ...baseline };
 	const skipped: string[] = [];
 	const errors: string[] = [];
+	let fileLimit: number | undefined;
 	const work = actions.filter((action) => action.type !== "unchanged" && action.type !== "forget");
 	let done = 0;
 	for (const action of actions) {
@@ -46,17 +53,25 @@ export async function execute(
 			await apply(action, io, next);
 			if (action.type === "skip-large") skipped.push(action.path);
 		} catch (error) {
-			if (error instanceof AuthError) return { baseline: next, skipped, errors, abort: "auth" };
-			if (error instanceof QuotaError) return { baseline: next, skipped, errors, abort: "quota" };
+			if (error instanceof AuthError) return { baseline: next, skipped, errors, fileLimit, abort: "auth" };
+			if (error instanceof QuotaError) return { baseline: next, skipped, errors, fileLimit, abort: "quota" };
+			if (error instanceof TooLargeError && error.limit > 0) {
+				skipped.push(action.path);
+				fileLimit = error.limit;
+				continue;
+			}
 			errors.push(`${action.type} ${action.path}: ${error instanceof Error ? error.message : "failed"}`);
 		}
 	}
-	return { baseline: next, skipped, errors };
+	return { baseline: next, skipped, errors, fileLimit };
 }
 
 async function apply(action: Action, io: SyncIO, baseline: Record<string, BaselineEntry>): Promise<void> {
 	switch (action.type) {
 		case "upload": {
+			if ((action.size ?? 0) > MAX_UPLOAD_BYTES && !io.streamPut) {
+				throw new Error("open the desktop app to upload files over 64 MB");
+			}
 			if (io.streamPut && (action.size ?? 0) > MAX_UPLOAD_BYTES) {
 				const put = await io.streamPut(action.path);
 				const stat = await io.stat(action.path);

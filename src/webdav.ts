@@ -28,10 +28,18 @@ export class QuotaError extends Error {
 }
 
 export class TooLargeError extends Error {
-	constructor() {
+	readonly limit: number;
+
+	constructor(limit = 0) {
 		super("too large");
 		this.name = "TooLargeError";
+		this.limit = limit;
 	}
+}
+
+export interface RemoteListing {
+	files: RemoteFile[];
+	fileLimit?: number;
 }
 
 export interface WebDavConfig {
@@ -57,9 +65,13 @@ export class WebDav {
 		this.config = config;
 	}
 
-	async list(): Promise<RemoteFile[]> {
+	async list(): Promise<RemoteListing> {
 		const response = await this.request("PROPFIND", folderUrl(this.config), { Depth: "infinity" });
-		return filesFromPropfind(new TextDecoder().decode(response.body), prefixPath(this.config));
+		const limit = limitBytes(header(response.headers, "x-syncup-file-limit"));
+		return {
+			files: filesFromPropfind(new TextDecoder().decode(response.body), prefixPath(this.config)),
+			fileLimit: limit || undefined,
+		};
 	}
 
 	async put(path: string, body: Uint8Array): Promise<{ etag: string }> {
@@ -93,7 +105,7 @@ export class WebDav {
 		});
 		if (response.status === 401 || response.status === 403) throw new AuthError();
 		if (response.status === 507) throw new QuotaError();
-		if (response.status === 413) throw new TooLargeError();
+		if (response.status === 413) throw new TooLargeError(limitBytes(header(response.headers, "x-syncup-file-limit")));
 		if (response.status >= 400) throw new Error(`webdav ${response.status}`);
 		return response;
 	}
@@ -181,6 +193,11 @@ export function cleanEtag(value: string): string {
 	if (etag.toLowerCase().startsWith("w/")) etag = etag.slice(2).trim();
 	if (etag.startsWith('"') && etag.endsWith('"') && etag.length >= 2) etag = etag.slice(1, -1);
 	return etag;
+}
+
+export function limitBytes(raw: string): number {
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
 function header(headers: Record<string, string>, name: string): string {

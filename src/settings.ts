@@ -10,7 +10,6 @@ export interface SyncUpSettings {
 	intervalMinutes: number;
 	syncOnStartup: boolean;
 	syncOnSave: boolean;
-	allowLargeFiles: boolean;
 	baseline: Record<string, BaselineEntry>;
 }
 
@@ -22,7 +21,6 @@ export const DEFAULT_SETTINGS: SyncUpSettings = {
 	intervalMinutes: 1,
 	syncOnStartup: true,
 	syncOnSave: true,
-	allowLargeFiles: false,
 	baseline: {},
 };
 
@@ -86,13 +84,6 @@ export class SyncUpSettingTab extends PluginSettingTab {
 			.setName("Sync on save")
 			.addToggle((toggle) => toggle.setValue(this.plugin.settings.syncOnSave).onChange(async (value) => {
 				this.plugin.settings.syncOnSave = value;
-				await this.plugin.saveSettings();
-			}));
-		new Setting(containerEl)
-			.setName("Sync large files")
-			.setDesc("Upload files larger than 64 MB. Your SyncUp plan still limits the maximum size. Off skips them and syncs everything else.")
-			.addToggle((toggle) => toggle.setValue(this.plugin.settings.allowLargeFiles).onChange(async (value) => {
-				this.plugin.settings.allowLargeFiles = value;
 				await this.plugin.saveSettings();
 			}));
 		new Setting(containerEl)

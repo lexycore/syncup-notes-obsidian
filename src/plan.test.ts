@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MAX_UPLOAD_BYTES, deleteCount, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
+import { deleteCount, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
 
 const local = (path: string, size: number, mtime: number): LocalFile => ({ path, size, mtime });
 const remote = (path: string, size: number, mtime: number, etag: string): RemoteFile => ({ path, size, mtime, etag });
@@ -133,21 +133,22 @@ test("counts files the sync would delete", () => {
 	assert.equal(deleteCount(actions), 2);
 });
 
-test("uploads a large file when large files are allowed", () => {
-	const actions = planSync({
-		local: [local("big.bin", MAX_UPLOAD_BYTES + 1, 1_000), local("ok.md", 2, 1_000)],
+test("uploads a video that fits the plan and skips one that does not", () => {
+	const video = 732 * 1024 * 1024;
+	const fits = planSync({
+		local: [local("talk.mp4", video, 1_000), local("ok.md", 2, 1_000)],
 		remote: [],
 		baseline: {},
-		allowLarge: true,
+		fileLimit: 2 * 1024 * 1024 * 1024,
 	});
-	assert.deepEqual(types(actions), ["upload big.bin", "upload ok.md"]);
-});
-
-test("skips an upload larger than 64 MiB and still syncs the rest", () => {
-	const actions = planSync({
-		local: [local("big.bin", MAX_UPLOAD_BYTES + 1, 1_000), local("ok.md", 2, 1_000)],
+	assert.deepEqual(types(fits), ["upload ok.md", "upload talk.mp4"]);
+	const over = planSync({
+		local: [local("talk.mp4", video, 1_000), local("ok.md", 2, 1_000)],
 		remote: [],
 		baseline: {},
+		fileLimit: 512 * 1024 * 1024,
 	});
-	assert.deepEqual(types(actions), ["upload ok.md", "skip-large big.bin"]);
+	assert.deepEqual(types(over), ["upload ok.md", "skip-large talk.mp4"]);
+	assert.equal(overLimitNotice(["Выступления/talk.mp4"], 512 * 1024 * 1024), "talk.mp4 is larger than the 512 MB limit on your plan");
+	assert.equal(overLimitNotice(["a.mp4", "b.mp4"], 2 * 1024 * 1024 * 1024), "2 files are larger than the 2 GB limit on your plan");
 });

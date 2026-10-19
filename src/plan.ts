@@ -64,42 +64,47 @@ export function planSync(input: {
 	local: LocalFile[];
 	remote: RemoteFile[];
 	baseline: Record<string, BaselineEntry>;
-	allowLarge?: boolean;
+	fileLimit?: number;
 }): Action[] {
 	const locals = new Map(input.local.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const remotes = new Map(input.remote.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const paths = new Set<string>([...locals.keys(), ...remotes.keys(), ...Object.keys(input.baseline)]);
-	const allowLarge = input.allowLarge === true;
 	const actions: Action[] = [];
 	for (const path of paths) {
-		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path], allowLarge);
+		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path], input.fileLimit);
 		if (action) actions.push(action);
 	}
 	actions.sort((a, b) => ORDER[a.type] - ORDER[b.type] || a.path.localeCompare(b.path));
 	return actions;
 }
 
-function decide(path: string, local?: LocalFile, remote?: RemoteFile, prior?: BaselineEntry, allowLarge = false): Action | null {
+function decide(
+	path: string,
+	local?: LocalFile,
+	remote?: RemoteFile,
+	prior?: BaselineEntry,
+	fileLimit?: number,
+): Action | null {
 	if (!local && !remote) return prior ? { type: "forget", path } : null;
-	if (!prior) return firstSight(path, local, remote, allowLarge);
+	if (!prior) return firstSight(path, local, remote, fileLimit);
 	const localChanged = local !== undefined && (local.size !== prior.size || local.mtime !== prior.mtime);
 	const remoteChanged = remote !== undefined && remote.etag !== prior.etag;
 	if (local && remote) {
 		if (!localChanged && !remoteChanged) return unchanged(path, local, remote);
-		if (localChanged && !remoteChanged) return uploadOrSkip(path, local, allowLarge);
+		if (localChanged && !remoteChanged) return uploadOrSkip(path, local, fileLimit);
 		if (!localChanged && remoteChanged) return download(remote);
-		return newer(local, remote) === "local" ? uploadOrSkip(path, local, allowLarge) : download(remote);
+		return newer(local, remote) === "local" ? uploadOrSkip(path, local, fileLimit) : download(remote);
 	}
-	if (local) return localChanged ? uploadOrSkip(path, local, allowLarge) : { type: "delete-local", path };
+	if (local) return localChanged ? uploadOrSkip(path, local, fileLimit) : { type: "delete-local", path };
 	return remote && remoteChanged ? download(remote) : { type: "delete-remote", path };
 }
 
-function firstSight(path: string, local?: LocalFile, remote?: RemoteFile, allowLarge = false): Action {
+function firstSight(path: string, local?: LocalFile, remote?: RemoteFile, fileLimit?: number): Action {
 	if (local && remote) {
 		if (local.size === remote.size) return unchanged(path, local, remote);
-		return newer(local, remote) === "local" ? uploadOrSkip(path, local, allowLarge) : download(remote);
+		return newer(local, remote) === "local" ? uploadOrSkip(path, local, fileLimit) : download(remote);
 	}
-	if (local) return uploadOrSkip(path, local, allowLarge);
+	if (local) return uploadOrSkip(path, local, fileLimit);
 	if (remote) return download(remote);
 	return { type: "download", path };
 }
@@ -108,9 +113,29 @@ function download(remote: RemoteFile): Action {
 	return { type: "download", path: remote.path, size: remote.size };
 }
 
-function uploadOrSkip(path: string, local: LocalFile, allowLarge: boolean): Action {
-	if (!allowLarge && local.size > MAX_UPLOAD_BYTES) return { type: "skip-large", path };
+function uploadOrSkip(path: string, local: LocalFile, fileLimit?: number): Action {
+	if (fileLimit !== undefined && local.size > fileLimit) return { type: "skip-large", path };
 	return { type: "upload", path, size: local.size };
+}
+
+export function overLimitNotice(paths: string[], fileLimit?: number): string {
+	const cap = fileLimit ? `the ${formatBytes(fileLimit)} limit on your plan` : "the limit on your plan";
+	if (paths.length === 1) {
+		const name = paths[0].split("/").pop() || paths[0];
+		return `${name} is larger than ${cap}`;
+	}
+	return `${paths.length} files are larger than ${cap}`;
+}
+
+export function formatBytes(value: number): string {
+	const gib = 1024 ** 3;
+	const mib = 1024 ** 2;
+	if (value >= gib && value % gib === 0) return `${value / gib} GB`;
+	if (value >= mib) {
+		const mb = value / mib;
+		return Number.isInteger(mb) ? `${mb} MB` : `${mb.toFixed(1)} MB`;
+	}
+	return `${value} B`;
 }
 
 function unchanged(path: string, local: LocalFile, remote: RemoteFile): Action {
