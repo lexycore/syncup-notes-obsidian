@@ -34,7 +34,7 @@ export GIT_CONFIG_VALUE_0='*'
 export GH_TOKEN="$GITHUB_TOKEN"
 
 echo "Pushing ${version} to github.com/${repo}"
-git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${repo}.git" HEAD:main
+git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${repo}.git" HEAD:refs/heads/main
 
 if gh release view "$version" --repo "$repo" >/dev/null 2>&1; then
 	echo "GitHub release ${version} already exists"
