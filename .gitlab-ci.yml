@@ -6,6 +6,7 @@ workflow:
 
 stages:
   - test
+  - build
   - publish
 
 test:
@@ -15,6 +16,17 @@ test:
   script:
     - npm ci
     - npm test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+build:
+  stage: build
+  image: node:22-alpine
+  tags: [docker]
+  needs: [test]
+  script:
+    - npm ci
     - npm run build
   artifacts:
     paths:
@@ -30,7 +42,7 @@ publish:
   stage: publish
   image: node:22-alpine
   tags: [docker]
-  needs: [test]
+  needs: [build]
   variables:
     GIT_DEPTH: "0"
   script:

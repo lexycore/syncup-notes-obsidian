@@ -1,4 +1,4 @@
-import type { Action, BaselineEntry } from "./plan.ts";
+import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
 import { AuthError, QuotaError } from "./webdav.ts";
 
 export interface SyncIO {
@@ -7,6 +7,8 @@ export interface SyncIO {
 	removeLocal(path: string): Promise<void>;
 	put(path: string, body: Uint8Array): Promise<{ etag: string }>;
 	get(path: string): Promise<{ body: Uint8Array; etag: string }>;
+	streamPut?(path: string): Promise<{ etag: string }>;
+	streamGet?(path: string): Promise<{ size: number; mtime: number; etag: string }>;
 	removeRemote(path: string): Promise<void>;
 	stat(path: string): Promise<{ size: number; mtime: number }>;
 }
@@ -55,6 +57,12 @@ export async function execute(
 async function apply(action: Action, io: SyncIO, baseline: Record<string, BaselineEntry>): Promise<void> {
 	switch (action.type) {
 		case "upload": {
+			if (io.streamPut && (action.size ?? 0) > MAX_UPLOAD_BYTES) {
+				const put = await io.streamPut(action.path);
+				const stat = await io.stat(action.path);
+				baseline[action.path] = { size: stat.size, mtime: stat.mtime, etag: put.etag };
+				return;
+			}
 			const body = await io.read(action.path);
 			const put = await io.put(action.path, body);
 			const stat = await io.stat(action.path);
@@ -62,6 +70,10 @@ async function apply(action: Action, io: SyncIO, baseline: Record<string, Baseli
 			return;
 		}
 		case "download": {
+			if (io.streamGet && (action.size ?? 0) > MAX_UPLOAD_BYTES) {
+				baseline[action.path] = await io.streamGet(action.path);
+				return;
+			}
 			const got = await io.get(action.path);
 			const stat = await io.write(action.path, got.body);
 			baseline[action.path] = { size: stat.size, mtime: stat.mtime, etag: got.etag };

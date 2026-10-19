@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, TFolder, requestUrl } from "obsidian";
+import { Notice, Platform, Plugin, TFile, TFolder, requestUrl } from "obsidian";
 
 interface ExplorerItem {
 	file?: object;
@@ -8,6 +8,7 @@ interface ExplorerItem {
 import { parentFolders } from "./folders";
 import { deleteCount, pathsDiffer, planSync, type BaselineEntry, type LocalFile } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
+import { desktopModules, partialFile, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
 import { execute, type SyncIO, type SyncProgress } from "./sync";
 import { encodeView, openFolders, parseView, snapshot, syncFolders, VIEW_PATH, type FolderToggle, type ViewState } from "./viewstate";
 import { AuthError, QuotaError, TooLargeError, WebDav, type HttpRequest, type HttpResponse } from "./webdav";
@@ -118,7 +119,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 			new Notice("SyncUp Notes: this vault and the server folder don't match, so nothing was changed.");
 			return false;
 		}
-		const actions = planSync({ local, remote, baseline: this.settings.baseline });
+		const actions = planSync({ local, remote, baseline: this.settings.baseline, allowLarge: this.settings.allowLargeFiles });
 		const deletes = deleteCount(actions);
 		if (deletes > 25) {
 			this.setStatus(`SyncUp · held ${deletes} deletes`);
@@ -157,6 +158,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 	}
 
 	private vaultIO(dav: WebDav): SyncIO {
+		const root = this.streamRoot();
 		return {
 			read: (path) => this.readFile(path),
 			write: (path, body) => this.writeFile(path, body),
@@ -165,7 +167,46 @@ export default class SyncUpNotesPlugin extends Plugin {
 			get: (path) => dav.get(path),
 			removeRemote: (path) => dav.remove(path),
 			stat: async (path) => this.statFile(path),
+			streamPut: root ? (path) => this.streamPut(dav, root, path) : undefined,
+			streamGet: root ? (path) => this.streamGet(dav, root, path) : undefined,
 		};
+	}
+
+	private streamRoot(): { modules: NodeModules; base: string } | null {
+		if (!Platform.isDesktopApp) return null;
+		const adapter = this.app.vault.adapter as { getBasePath?: () => string };
+		if (typeof adapter.getBasePath !== "function") return null;
+		const modules = desktopModules();
+		if (!modules) return null;
+		return { modules, base: adapter.getBasePath() };
+	}
+
+	private async streamPut(dav: WebDav, root: { modules: NodeModules; base: string }, vaultPath: string): Promise<{ etag: string }> {
+		const etag = await streamUpload(root.modules, vaultFile(root.modules, root.base, vaultPath), dav.fileURL(vaultPath), {
+			Authorization: dav.authHeader(),
+		});
+		return { etag };
+	}
+
+	private async streamGet(dav: WebDav, root: { modules: NodeModules; base: string }, vaultPath: string): Promise<{ size: number; mtime: number; etag: string }> {
+		this.applying = true;
+		try {
+			const etag = await streamDownload(
+				root.modules,
+				vaultFile(root.modules, root.base, vaultPath),
+				partialFile(root.modules, root.base, vaultPath),
+				dav.fileURL(vaultPath),
+				{ Authorization: dav.authHeader() },
+			);
+			for (let attempt = 0; attempt < 50; attempt++) {
+				const found = this.app.vault.getAbstractFileByPath(vaultPath);
+				if (found instanceof TFile) return { size: found.stat.size, mtime: found.stat.mtime, etag };
+				await new Promise((resolve) => window.setTimeout(resolve, 100));
+			}
+			throw new Error(`missing ${vaultPath}`);
+		} finally {
+			this.applying = false;
+		}
 	}
 
 	private async readFile(path: string): Promise<Uint8Array> {
@@ -238,9 +279,18 @@ export default class SyncUpNotesPlugin extends Plugin {
 	}
 
 	private async pullView() {
-		const state = await this.readView();
+		let text: string;
+		try {
+			const got = await this.dav().get(VIEW_PATH);
+			text = new TextDecoder().decode(got.body);
+		} catch (error) {
+			if (missing(error)) return;
+			throw error;
+		}
+		const state = parseView(text);
 		if (!state || state.updated <= this.lastApplied || state.updated === this.lastWritten) return;
 		await this.applyView(state);
+		await this.writeLocalView(text);
 	}
 
 	private async applyView(state: ViewState) {
@@ -306,24 +356,29 @@ export default class SyncUpNotesPlugin extends Plugin {
 		await leaf.openFile(file, { active: false });
 	}
 
-	private async readView(): Promise<ViewState | null> {
-		const existing = this.app.vault.getAbstractFileByPath(VIEW_PATH);
-		if (!(existing instanceof TFile)) return null;
-		return parseView(await this.app.vault.read(existing));
+	private dav(): WebDav {
+		return new WebDav((request) => this.http(request), this.settings);
 	}
 
 	private async writeView(state: ViewState) {
 		const text = encodeView(state);
 		this.publishingView = true;
 		try {
-			const existing = this.app.vault.getAbstractFileByPath(VIEW_PATH);
-			if (existing instanceof TFile) await this.app.vault.modify(existing, text);
-			else {
-				await this.ensureParents(VIEW_PATH);
-				await this.app.vault.create(VIEW_PATH, text);
-			}
+			await this.writeLocalView(text);
+			await this.dav().put(VIEW_PATH, new TextEncoder().encode(text));
 		} finally {
 			this.publishingView = false;
+		}
+	}
+
+	private async writeLocalView(text: string) {
+		const adapter = this.app.vault.adapter;
+		this.applying = true;
+		try {
+			if (!(await adapter.exists(".syncup"))) await adapter.mkdir(".syncup");
+			await adapter.write(VIEW_PATH, text);
+		} finally {
+			this.applying = false;
 		}
 	}
 
@@ -352,9 +407,13 @@ function copyBuffer(body: Uint8Array): ArrayBuffer {
 	return copy.buffer;
 }
 
+function missing(error: unknown): boolean {
+	return error instanceof Error && error.message === "webdav 404";
+}
+
 function failureText(error: unknown): string {
 	if (error instanceof AuthError) return "check the email and application password";
 	if (error instanceof QuotaError) return "storage is full";
-	if (error instanceof TooLargeError) return "a file is over 64 MB";
+	if (error instanceof TooLargeError) return "a file is too large for the server";
 	return error instanceof Error ? error.message : "sync failed";
 }

@@ -1,6 +1,6 @@
 export const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 
-const IGNORED = new Set([".obsidian", ".git", "node_modules"]);
+const IGNORED = new Set([".obsidian", ".git", ".syncup", "node_modules"]);
 
 export interface LocalFile {
 	path: string;
@@ -22,8 +22,8 @@ export interface BaselineEntry {
 }
 
 export type Action =
-	| { type: "upload"; path: string }
-	| { type: "download"; path: string }
+	| { type: "upload"; path: string; size?: number }
+	| { type: "download"; path: string; size?: number }
 	| { type: "delete-local"; path: string }
 	| { type: "delete-remote"; path: string }
 	| { type: "skip-large"; path: string }
@@ -64,45 +64,53 @@ export function planSync(input: {
 	local: LocalFile[];
 	remote: RemoteFile[];
 	baseline: Record<string, BaselineEntry>;
+	allowLarge?: boolean;
 }): Action[] {
 	const locals = new Map(input.local.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const remotes = new Map(input.remote.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const paths = new Set<string>([...locals.keys(), ...remotes.keys(), ...Object.keys(input.baseline)]);
+	const allowLarge = input.allowLarge === true;
 	const actions: Action[] = [];
 	for (const path of paths) {
-		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path]);
+		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path], allowLarge);
 		if (action) actions.push(action);
 	}
 	actions.sort((a, b) => ORDER[a.type] - ORDER[b.type] || a.path.localeCompare(b.path));
 	return actions;
 }
 
-function decide(path: string, local?: LocalFile, remote?: RemoteFile, prior?: BaselineEntry): Action | null {
+function decide(path: string, local?: LocalFile, remote?: RemoteFile, prior?: BaselineEntry, allowLarge = false): Action | null {
 	if (!local && !remote) return prior ? { type: "forget", path } : null;
-	if (!prior) return firstSight(path, local, remote);
+	if (!prior) return firstSight(path, local, remote, allowLarge);
 	const localChanged = local !== undefined && (local.size !== prior.size || local.mtime !== prior.mtime);
 	const remoteChanged = remote !== undefined && remote.etag !== prior.etag;
 	if (local && remote) {
 		if (!localChanged && !remoteChanged) return unchanged(path, local, remote);
-		if (localChanged && !remoteChanged) return uploadOrSkip(path, local);
-		if (!localChanged && remoteChanged) return { type: "download", path };
-		return newer(local, remote) === "local" ? uploadOrSkip(path, local) : { type: "download", path };
+		if (localChanged && !remoteChanged) return uploadOrSkip(path, local, allowLarge);
+		if (!localChanged && remoteChanged) return download(remote);
+		return newer(local, remote) === "local" ? uploadOrSkip(path, local, allowLarge) : download(remote);
 	}
-	if (local) return localChanged ? uploadOrSkip(path, local) : { type: "delete-local", path };
-	return remote && remoteChanged ? { type: "download", path } : { type: "delete-remote", path };
+	if (local) return localChanged ? uploadOrSkip(path, local, allowLarge) : { type: "delete-local", path };
+	return remote && remoteChanged ? download(remote) : { type: "delete-remote", path };
 }
 
-function firstSight(path: string, local?: LocalFile, remote?: RemoteFile): Action {
+function firstSight(path: string, local?: LocalFile, remote?: RemoteFile, allowLarge = false): Action {
 	if (local && remote) {
 		if (local.size === remote.size) return unchanged(path, local, remote);
-		return newer(local, remote) === "local" ? uploadOrSkip(path, local) : { type: "download", path };
+		return newer(local, remote) === "local" ? uploadOrSkip(path, local, allowLarge) : download(remote);
 	}
-	if (local) return uploadOrSkip(path, local);
+	if (local) return uploadOrSkip(path, local, allowLarge);
+	if (remote) return download(remote);
 	return { type: "download", path };
 }
 
-function uploadOrSkip(path: string, local: LocalFile): Action {
-	return local.size > MAX_UPLOAD_BYTES ? { type: "skip-large", path } : { type: "upload", path };
+function download(remote: RemoteFile): Action {
+	return { type: "download", path: remote.path, size: remote.size };
+}
+
+function uploadOrSkip(path: string, local: LocalFile, allowLarge: boolean): Action {
+	if (!allowLarge && local.size > MAX_UPLOAD_BYTES) return { type: "skip-large", path };
+	return { type: "upload", path, size: local.size };
 }
 
 function unchanged(path: string, local: LocalFile, remote: RemoteFile): Action {

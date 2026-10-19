@@ -23,7 +23,7 @@ JS
 
 for file in main.js manifest.json styles.css; do
 	if [ ! -f "$file" ]; then
-		echo "Missing ${file}. Run npm run build first." >&2
+		echo "Missing ${file}. The build job should have passed it as an artifact." >&2
 		exit 1
 	fi
 done

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Action, BaselineEntry } from "./plan.ts";
+import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
 import { execute, type SyncIO } from "./sync.ts";
 import { QuotaError } from "./webdav.ts";
 
@@ -14,6 +14,21 @@ test("an upload records the server etag and the local mtime", async () => {
 	const result = await execute([{ type: "upload", path: "a.md" }], io, baseline);
 	assert.deepEqual(result.baseline["a.md"], { size: 3, mtime: 5_000, etag: "sha" });
 	assert.deepEqual(result.errors, []);
+});
+
+test("a large upload streams from disk instead of reading the whole file", async () => {
+	let read = false;
+	const io = fake({
+		streamPut: async () => ({ etag: "stream" }),
+		stat: async () => ({ size: 9, mtime: 3 }),
+		read: async () => {
+			read = true;
+			return new Uint8Array();
+		},
+	});
+	const result = await execute([{ type: "upload", path: "big.bin", size: MAX_UPLOAD_BYTES + 1 }], io, {});
+	assert.equal(read, false);
+	assert.equal(result.baseline["big.bin"].etag, "stream");
 });
 
 test("a download writes the body and keeps the new local mtime", async () => {

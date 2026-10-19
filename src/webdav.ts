@@ -76,6 +76,14 @@ export class WebDav {
 		await this.request("DELETE", fileUrl(this.config, path));
 	}
 
+	fileURL(path: string): string {
+		return fileUrl(this.config, path);
+	}
+
+	authHeader(): string {
+		return basicAuth(this.config.username, this.config.password);
+	}
+
 	private async request(method: string, url: string, extra: Record<string, string> = {}, body?: Uint8Array): Promise<HttpResponse> {
 		const response = await this.http({
 			method,
@@ -168,7 +176,7 @@ function unescapeXml(value: string): string {
 		.replace(/&amp;/g, "&");
 }
 
-function cleanEtag(value: string): string {
+export function cleanEtag(value: string): string {
 	let etag = value.trim();
 	if (etag.toLowerCase().startsWith("w/")) etag = etag.slice(2).trim();
 	if (etag.startsWith('"') && etag.endsWith('"') && etag.length >= 2) etag = etag.slice(1, -1);
