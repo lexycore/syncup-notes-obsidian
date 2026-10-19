@@ -1,5 +1,6 @@
 /* SyncUp Notes reports progress in the status bar. */
 /* The shared open-note state is not a note. */
-.nav-folder:has(> .nav-folder-title[data-path=".syncup"]) {
+.nav-folder-title[data-path=".syncup"],
+.nav-folder-title[data-path=".syncup"] + .nav-folder-children {
 	display: none;
 }
