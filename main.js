@@ -362,6 +362,52 @@ function yieldToUI() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+// src/viewstate.ts
+var VIEW_PATH = ".syncup/view.json";
+function parseView(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!data || typeof data !== "object") return null;
+  const raw = data;
+  const expanded = Array.isArray(raw.expanded) ? raw.expanded.filter(isNotePath) : [];
+  const file = typeof raw.file === "string" && (raw.file === "" || isNotePath(raw.file)) ? raw.file : "";
+  const updated = typeof raw.updated === "number" && Number.isFinite(raw.updated) ? Math.max(0, Math.floor(raw.updated)) : 0;
+  return { v: 1, expanded: uniqueSorted(expanded).slice(0, 400), file, updated };
+}
+function encodeView(state) {
+  return JSON.stringify({ v: 1, expanded: uniqueSorted(state.expanded), file: state.file, updated: state.updated });
+}
+function syncFolders(folders, expanded) {
+  const want = new Set(expanded);
+  const ordered = [...folders].sort((a, b) => depth(a.path) - depth(b.path) || a.path.localeCompare(b.path));
+  for (const folder of ordered) {
+    const collapsed = !want.has(folder.path);
+    if (folder.collapsed !== collapsed) folder.setCollapsed(collapsed);
+  }
+}
+function openFolders(folders) {
+  return uniqueSorted(folders.filter((folder) => !folder.collapsed).map((folder) => folder.path));
+}
+function snapshot(expanded, file) {
+  return `${file}
+${uniqueSorted(expanded).join("\n")}`;
+}
+function isNotePath(value) {
+  if (typeof value !== "string" || !value || value.startsWith("/") || value.includes("\\")) return false;
+  if (value === ".syncup" || value.startsWith(".syncup/")) return false;
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
+}
+function uniqueSorted(paths) {
+  return [...new Set(paths)].sort((a, b) => a.localeCompare(b));
+}
+function depth(path) {
+  return path.split("/").length;
+}
+
 // src/main.ts
 var SAVE_DELAY_MS = 2e3;
 var SyncUpNotesPlugin = class extends import_obsidian2.Plugin {
@@ -374,6 +420,13 @@ var SyncUpNotesPlugin = class extends import_obsidian2.Plugin {
     this.applying = false;
     this.running = false;
     this.queued = false;
+    this.viewReady = false;
+    this.applyingView = false;
+    this.publishingView = false;
+    this.lastSnapshot = "";
+    this.lastWritten = 0;
+    this.lastApplied = 0;
+    this.holdPublishUntil = 0;
   }
   async onload() {
     await this.loadSettings();
@@ -386,6 +439,9 @@ var SyncUpNotesPlugin = class extends import_obsidian2.Plugin {
     this.registerEvent(this.app.vault.on("delete", () => this.onVaultChange()));
     this.registerEvent(this.app.vault.on("rename", () => this.onVaultChange()));
     this.armInterval();
+    this.app.workspace.onLayoutReady(() => {
+      this.registerInterval(window.setInterval(() => void this.publishExplorer(), 1e3));
+    });
     if (this.settings.syncOnStartup) void this.sync();
   }
   onunload() {
@@ -431,6 +487,17 @@ var SyncUpNotesPlugin = class extends import_obsidian2.Plugin {
       this.setStatus("SyncUp \xB7 sign in");
       return;
     }
+    let aligned = false;
+    try {
+      aligned = await this.syncVault();
+    } finally {
+      if (aligned) {
+        await this.pullView();
+        this.viewReady = true;
+      }
+    }
+  }
+  async syncVault() {
     this.setStatus("SyncUp \xB7 listing");
     const dav = new WebDav((request) => this.http(request), this.settings);
     const remote = await dav.list();
@@ -438,14 +505,14 @@ var SyncUpNotesPlugin = class extends import_obsidian2.Plugin {
     if (pathsDiffer(local, remote)) {
       this.setStatus("SyncUp \xB7 paths differ");
       new import_obsidian2.Notice("SyncUp Notes: this vault and the server folder don't match, so nothing was changed.");
-      return;
+      return false;
     }
     const actions = planSync({ local, remote, baseline: this.settings.baseline });
     const deletes = deleteCount(actions);
     if (deletes > 25) {
       this.setStatus(`SyncUp \xB7 held ${deletes} deletes`);
       new import_obsidian2.Notice(`SyncUp Notes: stopped before deleting ${deletes} files.`);
-      return;
+      return true;
     }
     const before = JSON.stringify(this.settings.baseline);
     const result = await execute(actions, this.vaultIO(dav), this.settings.baseline, (update) => this.showProgress(update));
@@ -454,23 +521,24 @@ var SyncUpNotesPlugin = class extends import_obsidian2.Plugin {
     if (result.abort === "auth") {
       this.setStatus("SyncUp \xB7 failed");
       new import_obsidian2.Notice("SyncUp Notes: check the email and application password");
-      return;
+      return true;
     }
     if (result.abort === "quota") {
       this.setStatus("SyncUp \xB7 storage full");
       new import_obsidian2.Notice("SyncUp Notes: storage is full");
-      return;
+      return true;
     }
     if (result.errors.length > 0) {
       this.setStatus("SyncUp \xB7 failed");
       new import_obsidian2.Notice(`SyncUp Notes: ${result.errors[0]}`);
-      return;
+      return true;
     }
     if (result.skipped.length > 0) {
       this.setStatus(`SyncUp \xB7 skipped ${result.skipped.length} large`);
-      return;
+      return true;
     }
     this.setStatus("SyncUp \xB7 up to date");
+    return true;
   }
   localFiles() {
     return this.app.vault.getFiles().map((file) => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime }));
@@ -547,6 +615,89 @@ var SyncUpNotesPlugin = class extends import_obsidian2.Plugin {
       throw: false
     });
     return { status: response.status, headers: response.headers, body: new Uint8Array(response.arrayBuffer) };
+  }
+  async pullView() {
+    const state = await this.readView();
+    if (!state || state.updated <= this.lastApplied || state.updated === this.lastWritten) return;
+    await this.applyView(state);
+  }
+  async applyView(state) {
+    this.applyingView = true;
+    this.holdPublishUntil = Date.now() + 600;
+    try {
+      syncFolders(this.folders(), state.expanded);
+      await this.openNote(state.file);
+      this.lastApplied = state.updated;
+      this.lastWritten = state.updated;
+    } finally {
+      this.applyingView = false;
+    }
+    const timer = window.setTimeout(() => {
+      if (this.lastApplied !== state.updated) return;
+      syncFolders(this.folders(), state.expanded);
+      const file = this.app.workspace.getActiveFile()?.path || state.file;
+      this.lastSnapshot = snapshot(openFolders(this.folders()), file);
+    }, 250);
+    this.register(() => window.clearTimeout(timer));
+  }
+  async publishExplorer() {
+    if (!this.viewReady || this.applyingView || this.publishingView || Date.now() < this.holdPublishUntil) return;
+    const expanded = openFolders(this.folders());
+    const file = this.app.workspace.getActiveFile()?.path ?? "";
+    const snap = snapshot(expanded, file);
+    if (snap === this.lastSnapshot) return;
+    const next = { v: 1, expanded, file, updated: Date.now() };
+    try {
+      await this.writeView(next);
+    } catch {
+      return;
+    }
+    this.lastSnapshot = snap;
+    this.lastWritten = next.updated;
+    this.lastApplied = next.updated;
+  }
+  folders() {
+    const leaf = this.app.workspace.getLeavesOfType("file-explorer")[0];
+    const items = leaf?.view?.fileItems;
+    if (!items) return [];
+    const folders = [];
+    for (const item of Object.values(items)) {
+      const setCollapsed = item?.setCollapsed;
+      if (!(item?.file instanceof import_obsidian2.TFolder) || typeof setCollapsed !== "function") continue;
+      folders.push({
+        path: item.file.path,
+        collapsed: !!item.collapsed,
+        setCollapsed: (collapsed) => setCollapsed(collapsed)
+      });
+    }
+    return folders;
+  }
+  async openNote(path) {
+    if (!path) return;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian2.TFile)) return;
+    if (this.app.workspace.getActiveFile()?.path === path) return;
+    const leaf = this.app.workspace.getMostRecentLeaf() ?? this.app.workspace.getLeaf(false);
+    await leaf.openFile(file, { active: false });
+  }
+  async readView() {
+    const existing = this.app.vault.getAbstractFileByPath(VIEW_PATH);
+    if (!(existing instanceof import_obsidian2.TFile)) return null;
+    return parseView(await this.app.vault.read(existing));
+  }
+  async writeView(state) {
+    const text = encodeView(state);
+    this.publishingView = true;
+    try {
+      const existing = this.app.vault.getAbstractFileByPath(VIEW_PATH);
+      if (existing instanceof import_obsidian2.TFile) await this.app.vault.modify(existing, text);
+      else {
+        await this.ensureParents(VIEW_PATH);
+        await this.app.vault.create(VIEW_PATH, text);
+      }
+    } finally {
+      this.publishingView = false;
+    }
   }
   onVaultChange() {
     if (this.applying || !this.settings.syncOnSave) return;

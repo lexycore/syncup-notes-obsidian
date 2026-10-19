@@ -1,8 +1,15 @@
 import { Notice, Plugin, TFile, TFolder, requestUrl } from "obsidian";
+
+interface ExplorerItem {
+	file?: object;
+	collapsed?: boolean;
+	setCollapsed?(collapsed: boolean): void;
+}
 import { parentFolders } from "./folders";
 import { deleteCount, pathsDiffer, planSync, type BaselineEntry, type LocalFile } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
 import { execute, type SyncIO, type SyncProgress } from "./sync";
+import { encodeView, openFolders, parseView, snapshot, syncFolders, VIEW_PATH, type FolderToggle, type ViewState } from "./viewstate";
 import { AuthError, QuotaError, TooLargeError, WebDav, type HttpRequest, type HttpResponse } from "./webdav";
 
 const SAVE_DELAY_MS = 2000;
@@ -15,6 +22,13 @@ export default class SyncUpNotesPlugin extends Plugin {
 	private applying = false;
 	private running = false;
 	private queued = false;
+	private viewReady = false;
+	private applyingView = false;
+	private publishingView = false;
+	private lastSnapshot = "";
+	private lastWritten = 0;
+	private lastApplied = 0;
+	private holdPublishUntil = 0;
 
 	async onload() {
 		await this.loadSettings();
@@ -27,6 +41,9 @@ export default class SyncUpNotesPlugin extends Plugin {
 		this.registerEvent(this.app.vault.on("delete", () => this.onVaultChange()));
 		this.registerEvent(this.app.vault.on("rename", () => this.onVaultChange()));
 		this.armInterval();
+		this.app.workspace.onLayoutReady(() => {
+			this.registerInterval(window.setInterval(() => void this.publishExplorer(), 1000));
+		});
 		if (this.settings.syncOnStartup) void this.sync();
 	}
 
@@ -80,6 +97,18 @@ export default class SyncUpNotesPlugin extends Plugin {
 			this.setStatus("SyncUp · sign in");
 			return;
 		}
+		let aligned = false;
+		try {
+			aligned = await this.syncVault();
+		} finally {
+			if (aligned) {
+				await this.pullView();
+				this.viewReady = true;
+			}
+		}
+	}
+
+	private async syncVault(): Promise<boolean> {
 		this.setStatus("SyncUp · listing");
 		const dav = new WebDav((request) => this.http(request), this.settings);
 		const remote = await dav.list();
@@ -87,14 +116,14 @@ export default class SyncUpNotesPlugin extends Plugin {
 		if (pathsDiffer(local, remote)) {
 			this.setStatus("SyncUp · paths differ");
 			new Notice("SyncUp Notes: this vault and the server folder don't match, so nothing was changed.");
-			return;
+			return false;
 		}
 		const actions = planSync({ local, remote, baseline: this.settings.baseline });
 		const deletes = deleteCount(actions);
 		if (deletes > 25) {
 			this.setStatus(`SyncUp · held ${deletes} deletes`);
 			new Notice(`SyncUp Notes: stopped before deleting ${deletes} files.`);
-			return;
+			return true;
 		}
 		const before = JSON.stringify(this.settings.baseline);
 		const result = await execute(actions, this.vaultIO(dav), this.settings.baseline, (update) => this.showProgress(update));
@@ -103,23 +132,24 @@ export default class SyncUpNotesPlugin extends Plugin {
 		if (result.abort === "auth") {
 			this.setStatus("SyncUp · failed");
 			new Notice("SyncUp Notes: check the email and application password");
-			return;
+			return true;
 		}
 		if (result.abort === "quota") {
 			this.setStatus("SyncUp · storage full");
 			new Notice("SyncUp Notes: storage is full");
-			return;
+			return true;
 		}
 		if (result.errors.length > 0) {
 			this.setStatus("SyncUp · failed");
 			new Notice(`SyncUp Notes: ${result.errors[0]}`);
-			return;
+			return true;
 		}
 		if (result.skipped.length > 0) {
 			this.setStatus(`SyncUp · skipped ${result.skipped.length} large`);
-			return;
+			return true;
 		}
 		this.setStatus("SyncUp · up to date");
+		return true;
 	}
 
 	private localFiles(): LocalFile[] {
@@ -205,6 +235,96 @@ export default class SyncUpNotesPlugin extends Plugin {
 			throw: false,
 		});
 		return { status: response.status, headers: response.headers, body: new Uint8Array(response.arrayBuffer) };
+	}
+
+	private async pullView() {
+		const state = await this.readView();
+		if (!state || state.updated <= this.lastApplied || state.updated === this.lastWritten) return;
+		await this.applyView(state);
+	}
+
+	private async applyView(state: ViewState) {
+		this.applyingView = true;
+		this.holdPublishUntil = Date.now() + 600;
+		try {
+			syncFolders(this.folders(), state.expanded);
+			await this.openNote(state.file);
+			this.lastApplied = state.updated;
+			this.lastWritten = state.updated;
+		} finally {
+			this.applyingView = false;
+		}
+		const timer = window.setTimeout(() => {
+			if (this.lastApplied !== state.updated) return;
+			syncFolders(this.folders(), state.expanded);
+			const file = this.app.workspace.getActiveFile()?.path || state.file;
+			this.lastSnapshot = snapshot(openFolders(this.folders()), file);
+		}, 250);
+		this.register(() => window.clearTimeout(timer));
+	}
+
+	private async publishExplorer() {
+		if (!this.viewReady || this.applyingView || this.publishingView || Date.now() < this.holdPublishUntil) return;
+		const expanded = openFolders(this.folders());
+		const file = this.app.workspace.getActiveFile()?.path ?? "";
+		const snap = snapshot(expanded, file);
+		if (snap === this.lastSnapshot) return;
+		const next: ViewState = { v: 1, expanded, file, updated: Date.now() };
+		try {
+			await this.writeView(next);
+		} catch {
+			return;
+		}
+		this.lastSnapshot = snap;
+		this.lastWritten = next.updated;
+		this.lastApplied = next.updated;
+	}
+
+	private folders(): FolderToggle[] {
+		const leaf = this.app.workspace.getLeavesOfType("file-explorer")[0];
+		const items = (leaf?.view as { fileItems?: Record<string, ExplorerItem> } | undefined)?.fileItems;
+		if (!items) return [];
+		const folders: FolderToggle[] = [];
+		for (const item of Object.values(items)) {
+			const setCollapsed = item?.setCollapsed;
+			if (!(item?.file instanceof TFolder) || typeof setCollapsed !== "function") continue;
+			folders.push({
+				path: item.file.path,
+				collapsed: !!item.collapsed,
+				setCollapsed: (collapsed) => setCollapsed(collapsed),
+			});
+		}
+		return folders;
+	}
+
+	private async openNote(path: string) {
+		if (!path) return;
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return;
+		if (this.app.workspace.getActiveFile()?.path === path) return;
+		const leaf = this.app.workspace.getMostRecentLeaf() ?? this.app.workspace.getLeaf(false);
+		await leaf.openFile(file, { active: false });
+	}
+
+	private async readView(): Promise<ViewState | null> {
+		const existing = this.app.vault.getAbstractFileByPath(VIEW_PATH);
+		if (!(existing instanceof TFile)) return null;
+		return parseView(await this.app.vault.read(existing));
+	}
+
+	private async writeView(state: ViewState) {
+		const text = encodeView(state);
+		this.publishingView = true;
+		try {
+			const existing = this.app.vault.getAbstractFileByPath(VIEW_PATH);
+			if (existing instanceof TFile) await this.app.vault.modify(existing, text);
+			else {
+				await this.ensureParents(VIEW_PATH);
+				await this.app.vault.create(VIEW_PATH, text);
+			}
+		} finally {
+			this.publishingView = false;
+		}
 	}
 
 	private onVaultChange() {
