@@ -40,6 +40,7 @@ export class TooLargeError extends Error {
 export interface RemoteListing {
 	files: RemoteFile[];
 	fileLimit?: number;
+	resume: boolean;
 }
 
 export interface WebDavConfig {
@@ -71,6 +72,7 @@ export class WebDav {
 		return {
 			files: filesFromPropfind(new TextDecoder().decode(response.body), prefixPath(this.config)),
 			fileLimit: limit || undefined,
+			resume: header(response.headers, "x-syncup-resume") === "1",
 		};
 	}
 

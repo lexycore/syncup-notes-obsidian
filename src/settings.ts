@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type SyncUpNotesPlugin from "./main";
-import type { BaselineEntry } from "./plan";
+import type { BaselineEntry, TransferAttempt } from "./plan";
 
 export interface SyncUpSettings {
 	server: string;
@@ -11,6 +11,7 @@ export interface SyncUpSettings {
 	syncOnStartup: boolean;
 	syncOnSave: boolean;
 	baseline: Record<string, BaselineEntry>;
+	retries: Record<string, TransferAttempt>;
 }
 
 export const DEFAULT_SETTINGS: SyncUpSettings = {
@@ -22,6 +23,7 @@ export const DEFAULT_SETTINGS: SyncUpSettings = {
 	syncOnStartup: true,
 	syncOnSave: true,
 	baseline: {},
+	retries: {},
 };
 
 export class SyncUpSettingTab extends PluginSettingTab {

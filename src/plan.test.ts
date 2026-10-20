@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deleteCount, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
+import { deleteCount, MAX_TRANSFER_ATTEMPTS, overLimitNotice, pathsDiffer, planSync, transferKey, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
 
 const local = (path: string, size: number, mtime: number): LocalFile => ({ path, size, mtime });
 const remote = (path: string, size: number, mtime: number, etag: string): RemoteFile => ({ path, size, mtime, etag });
@@ -151,4 +151,30 @@ test("uploads a video that fits the plan and skips one that does not", () => {
 	assert.deepEqual(types(over), ["upload ok.md", "skip-large talk.mp4"]);
 	assert.equal(overLimitNotice(["Выступления/talk.mp4"], 512 * 1024 * 1024), "talk.mp4 is larger than the 512 MB limit on your plan");
 	assert.equal(overLimitNotice(["a.mp4", "b.mp4"], 2 * 1024 * 1024 * 1024), "2 files are larger than the 2 GB limit on your plan");
+});
+
+test("a transfer pauses after repeated failures and resumes when the file changes", () => {
+	const file = remote("clip.mp4", 10, 2_000, "v1");
+	const key = transferKey("download", { etag: "v1", size: 10 });
+	const again = planSync({
+		local: [],
+		remote: [file],
+		baseline: {},
+		attempts: { "clip.mp4": { attempts: MAX_TRANSFER_ATTEMPTS - 1, key } },
+	});
+	assert.deepEqual(types(again), ["download clip.mp4"]);
+	const paused = planSync({
+		local: [],
+		remote: [file],
+		baseline: {},
+		attempts: { "clip.mp4": { attempts: MAX_TRANSFER_ATTEMPTS, key } },
+	});
+	assert.deepEqual(types(paused), ["paused clip.mp4"]);
+	const changed = planSync({
+		local: [],
+		remote: [remote("clip.mp4", 10, 3_000, "v2")],
+		baseline: {},
+		attempts: { "clip.mp4": { attempts: MAX_TRANSFER_ATTEMPTS, key } },
+	});
+	assert.deepEqual(types(changed), ["download clip.mp4"]);
 });

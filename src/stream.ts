@@ -5,8 +5,10 @@ declare function require(id: string): unknown;
 interface Fs {
 	statSync(file: string): { size: number };
 	mkdirSync(dir: string, options: { recursive: boolean }): void;
-	createReadStream(file: string): Readable;
-	createWriteStream(file: string): Writable;
+	readFileSync(file: string, encoding: "utf8"): string;
+	writeFileSync(file: string, data: string): void;
+	createReadStream(file: string, options?: { start?: number }): Readable;
+	createWriteStream(file: string, options?: { flags?: string }): Writable;
 	renameSync(from: string, to: string): void;
 	rmSync(file: string, options?: { force?: boolean }): void;
 }
@@ -81,16 +83,74 @@ export function partialFile(modules: NodeModules, base: string, vaultPath: strin
 	return vaultFile(modules, staging, vaultPath);
 }
 
-export function streamUpload(modules: NodeModules, file: string, url: string, headers: Record<string, string>): Promise<string> {
+export function partialMeta(partial: string): string {
+	return `${partial}.meta`;
+}
+
+export function preparePartial(modules: NodeModules, partial: string, etag: string, size: number): number {
+	const offset = keptOffset(modules, partial, etag, size);
+	if (offset === 0) {
+		try {
+			modules.fs.rmSync(partial, { force: true });
+		} catch {
+			// Nothing to discard.
+		}
+		try {
+			modules.fs.rmSync(partialMeta(partial), { force: true });
+		} catch {
+			// Nothing to discard.
+		}
+	}
+	modules.fs.mkdirSync(modules.path.dirname(partial), { recursive: true });
+	modules.fs.writeFileSync(partialMeta(partial), JSON.stringify({ etag, size }));
+	return offset;
+}
+
+export function forgetPartialMeta(modules: NodeModules, partial: string): void {
+	try {
+		modules.fs.rmSync(partialMeta(partial), { force: true });
+	} catch {
+		// The resume note is already gone.
+	}
+}
+
+function keptOffset(modules: NodeModules, partial: string, etag: string, size: number): number {
+	if (!etag || size <= 0) return 0;
+	let have = 0;
+	try {
+		have = modules.fs.statSync(partial).size;
+	} catch {
+		return 0;
+	}
+	let meta: { etag?: string; size?: number };
+	try {
+		meta = JSON.parse(modules.fs.readFileSync(partialMeta(partial), "utf8")) as { etag?: string; size?: number };
+	} catch {
+		return 0;
+	}
+	if (meta.etag !== etag || meta.size !== size || have <= 0 || have >= size) return 0;
+	return have;
+}
+
+export async function streamUpload(modules: NodeModules, file: string, url: string, headers: Record<string, string>, resume = false): Promise<string> {
 	const size = modules.fs.statSync(file).size;
 	const target = new URL(url);
 	const client = target.protocol === "https:" ? modules.https : modules.http;
+	let offset = 0;
+	if (resume && size > 0) {
+		const probed = await uploadOffset(client, target, headers, size);
+		if (probed.etag) return probed.etag;
+		offset = probed.offset > 0 && probed.offset < size ? probed.offset : 0;
+	}
+	const length = size - offset;
+	const putHeaders: Record<string, string> = { ...headers, "Content-Length": String(length) };
+	if (resume && size > 0) putHeaders["Content-Range"] = `bytes ${offset}-${Math.max(offset, size - 1)}/${size}`;
 	return new Promise((resolve, reject) => {
-		const req = client.request(target, { method: "PUT", headers: { ...headers, "Content-Length": String(size) } }, (res) => {
+		const req = client.request(target, { method: "PUT", headers: putHeaders }, (res) => {
 			settle(res, resolve, reject);
 		});
 		req.on("error", reject);
-		const body = modules.fs.createReadStream(file);
+		const body = modules.fs.createReadStream(file, offset > 0 ? { start: offset } : undefined);
 		body.on("error", (error) => {
 			req.destroy(error);
 			reject(error);
@@ -99,20 +159,51 @@ export function streamUpload(modules: NodeModules, file: string, url: string, he
 	});
 }
 
-export function streamDownload(modules: NodeModules, dest: string, partial: string, url: string, headers: Record<string, string>): Promise<string> {
+function uploadOffset(client: Http, target: URL, headers: Record<string, string>, size: number): Promise<{ offset: number; etag?: string }> {
+	return new Promise((resolve, reject) => {
+		const req = client.request(
+			target,
+			{ method: "PUT", headers: { ...headers, "Content-Range": `bytes */${size}`, "Content-Length": "0" } },
+			(res) => {
+				const status = res.statusCode ?? 0;
+				const offset = Number(oneHeader(res.headers, "x-syncup-offset"));
+				const etag = cleanEtag(oneHeader(res.headers, "etag"));
+				res.on("end", () => {
+					if (status >= 400) {
+						reject(statusError(status, res.headers) ?? new Error(`webdav ${status}`));
+						return;
+					}
+					if ((status === 200 || status === 201) && etag) {
+						resolve({ offset: size, etag });
+						return;
+					}
+					resolve({ offset: Number.isSafeInteger(offset) && offset > 0 ? offset : 0 });
+				});
+				res.resume();
+			},
+		);
+		req.on("error", reject);
+		req.end();
+	});
+}
+
+export function streamDownload(modules: NodeModules, dest: string, partial: string, url: string, headers: Record<string, string>, offset = 0): Promise<string> {
 	modules.fs.mkdirSync(modules.path.dirname(partial), { recursive: true });
 	modules.fs.mkdirSync(modules.path.dirname(dest), { recursive: true });
 	const target = new URL(url);
 	const client = target.protocol === "https:" ? modules.https : modules.http;
+	const getHeaders = offset > 0 ? { ...headers, Range: `bytes=${offset}-` } : headers;
 	return new Promise<string>((resolve, reject) => {
-		const req = client.request(target, { method: "GET", headers }, (res) => {
-			const failed = statusError(res.statusCode ?? 0, res.headers);
+		const req = client.request(target, { method: "GET", headers: getHeaders }, (res) => {
+			const status = res.statusCode ?? 0;
+			const failed = statusError(status, res.headers);
 			if (failed) {
 				res.resume();
 				reject(failed);
 				return;
 			}
-			const out = modules.fs.createWriteStream(partial);
+			const rewrite = offset === 0 || status === 200;
+			const out = modules.fs.createWriteStream(partial, { flags: rewrite ? "w" : "a" });
 			res.on("error", reject);
 			out.on("error", reject);
 			out.on("finish", () => {
@@ -127,12 +218,6 @@ export function streamDownload(modules: NodeModules, dest: string, partial: stri
 		});
 		req.on("error", reject);
 		req.end();
-	}).finally(() => {
-		try {
-			modules.fs.rmSync(partial, { force: true });
-		} catch {
-			// Renamed into the vault, or it was never created.
-		}
 	});
 }
 

@@ -1,4 +1,5 @@
 export const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
+export const MAX_TRANSFER_ATTEMPTS = 5;
 
 const IGNORED = new Set([".obsidian", ".git", ".syncup", "node_modules"]);
 
@@ -21,12 +22,18 @@ export interface BaselineEntry {
 	etag: string;
 }
 
+export interface TransferAttempt {
+	attempts: number;
+	key: string;
+}
+
 export type Action =
-	| { type: "upload"; path: string; size?: number }
-	| { type: "download"; path: string; size?: number }
+	| { type: "upload"; path: string; size?: number; mtime?: number }
+	| { type: "download"; path: string; size?: number; etag?: string }
 	| { type: "delete-local"; path: string }
 	| { type: "delete-remote"; path: string }
 	| { type: "skip-large"; path: string }
+	| { type: "paused"; path: string }
 	| { type: "unchanged"; path: string; etag: string; size: number; mtime: number }
 	| { type: "forget"; path: string };
 
@@ -37,8 +44,14 @@ const ORDER: Record<Action["type"], number> = {
 	upload: 3,
 	"skip-large": 4,
 	unchanged: 5,
-	forget: 6,
+	paused: 6,
+	forget: 7,
 };
+
+export function transferKey(op: "upload" | "download", file: { size?: number; mtime?: number; etag?: string }): string {
+	if (op === "download") return `download:${file.etag ?? ""}:${file.size ?? 0}`;
+	return `upload:${file.size ?? 0}:${file.mtime ?? 0}`;
+}
 
 export function ignored(path: string): boolean {
 	return path.split("/").some((part) => IGNORED.has(part));
@@ -65,6 +78,7 @@ export function planSync(input: {
 	remote: RemoteFile[];
 	baseline: Record<string, BaselineEntry>;
 	fileLimit?: number;
+	attempts?: Record<string, TransferAttempt>;
 }): Action[] {
 	const locals = new Map(input.local.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const remotes = new Map(input.remote.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
@@ -72,7 +86,7 @@ export function planSync(input: {
 	const actions: Action[] = [];
 	for (const path of paths) {
 		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path], input.fileLimit);
-		if (action) actions.push(action);
+		if (action) actions.push(pauseTransfer(action, input.attempts));
 	}
 	actions.sort((a, b) => ORDER[a.type] - ORDER[b.type] || a.path.localeCompare(b.path));
 	return actions;
@@ -110,12 +124,20 @@ function firstSight(path: string, local?: LocalFile, remote?: RemoteFile, fileLi
 }
 
 function download(remote: RemoteFile): Action {
-	return { type: "download", path: remote.path, size: remote.size };
+	return { type: "download", path: remote.path, size: remote.size, etag: remote.etag };
 }
 
 function uploadOrSkip(path: string, local: LocalFile, fileLimit?: number): Action {
 	if (fileLimit !== undefined && local.size > fileLimit) return { type: "skip-large", path };
-	return { type: "upload", path, size: local.size };
+	return { type: "upload", path, size: local.size, mtime: local.mtime };
+}
+
+function pauseTransfer(action: Action, attempts?: Record<string, TransferAttempt>): Action {
+	if ((action.type !== "upload" && action.type !== "download") || !attempts) return action;
+	const key = transferKey(action.type, action);
+	const prior = attempts[action.path];
+	if (prior && prior.key === key && prior.attempts >= MAX_TRANSFER_ATTEMPTS) return { type: "paused", path: action.path };
+	return action;
 }
 
 export function overLimitNotice(paths: string[], fileLimit?: number): string {

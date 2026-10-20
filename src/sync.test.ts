@@ -31,6 +31,24 @@ test("a large upload streams from disk instead of reading the whole file", async
 	assert.equal(result.baseline["big.bin"].etag, "stream");
 });
 
+test("a desktop download streams instead of buffering the file", async () => {
+	let streamed = false;
+	const io = fake({
+		streamGet: async (_path, file) => {
+			streamed = file.etag === "e" && file.size === 4;
+			return { size: 4, mtime: 2, etag: "e" };
+		},
+		get: async () => {
+			throw new Error("buffered");
+		},
+	});
+	const result = await execute([{ type: "download", path: "a.md", size: 4, etag: "e" }], io, {});
+	assert.equal(streamed, true);
+	assert.equal(result.baseline["a.md"].etag, "e");
+	assert.deepEqual(result.failed, []);
+	assert.deepEqual(result.transferred, ["a.md"]);
+});
+
 test("a download writes the body and keeps the new local mtime", async () => {
 	const io = fake({
 		get: async () => ({ body: new Uint8Array([4]), etag: "new" }),

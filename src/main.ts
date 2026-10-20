@@ -6,9 +6,9 @@ interface ExplorerItem {
 	setCollapsed?(collapsed: boolean): void;
 }
 import { parentFolders } from "./folders";
-import { deleteCount, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile } from "./plan";
+import { deleteCount, MAX_TRANSFER_ATTEMPTS, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
-import { desktopModules, partialFile, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
+import { desktopModules, forgetPartialMeta, partialFile, preparePartial, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
 import { execute, type SyncIO, type SyncProgress } from "./sync";
 import { encodeView, openFolders, parseView, snapshot, syncFolders, VIEW_PATH, type FolderToggle, type ViewState } from "./viewstate";
 import { AuthError, QuotaError, TooLargeError, WebDav, type HttpRequest, type HttpResponse } from "./webdav";
@@ -16,7 +16,8 @@ import { AuthError, QuotaError, TooLargeError, WebDav, type HttpRequest, type Ht
 const SAVE_DELAY_MS = 2000;
 
 export default class SyncUpNotesPlugin extends Plugin {
-	settings: SyncUpSettings = { ...DEFAULT_SETTINGS, baseline: {} };
+	settings: SyncUpSettings = { ...DEFAULT_SETTINGS, baseline: {}, retries: {} };
+	private serverResume = false;
 	private statusEl: HTMLElement | null = null;
 	private saveTimer: number | null = null;
 	private intervalTimer: number | null = null;
@@ -55,7 +56,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 
 	async loadSettings() {
 		const stored = await this.loadData();
-		this.settings = { ...DEFAULT_SETTINGS, ...(stored ?? {}), baseline: stored?.baseline ?? {} };
+		this.settings = { ...DEFAULT_SETTINGS, ...(stored ?? {}), baseline: stored?.baseline ?? {}, retries: stored?.retries ?? {} };
 	}
 
 	async saveSettings() {
@@ -113,6 +114,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 		this.setStatus("SyncUp · listing");
 		const dav = new WebDav((request) => this.http(request), this.settings);
 		const listing = await dav.list();
+		this.serverResume = listing.resume;
 		const remote = listing.files;
 		const local = this.localFiles();
 		if (pathsDiffer(local, remote)) {
@@ -120,7 +122,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 			new Notice("SyncUp Notes: this vault and the server folder don't match, so nothing was changed.");
 			return false;
 		}
-		const actions = planSync({ local, remote, baseline: this.settings.baseline, fileLimit: listing.fileLimit });
+		const actions = planSync({ local, remote, baseline: this.settings.baseline, fileLimit: listing.fileLimit, attempts: this.settings.retries });
 		const deletes = deleteCount(actions);
 		if (deletes > 25) {
 			this.setStatus(`SyncUp · held ${deletes} deletes`);
@@ -145,7 +147,8 @@ export default class SyncUpNotesPlugin extends Plugin {
 			const limit = result.fileLimit ?? listing.fileLimit;
 			new Notice(`SyncUp Notes: ${overLimitNotice(result.skipped, limit)}`);
 		}
-		if (result.errors.length > 0) {
+		const paused = this.noteFailures(result.failed, result.transferred);
+		if (result.errors.length > 0 && !paused) {
 			this.setStatus("SyncUp · failed");
 			new Notice(`SyncUp Notes: ${result.errors[0]}`);
 			return true;
@@ -173,7 +176,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 			removeRemote: (path) => dav.remove(path),
 			stat: async (path) => this.statFile(path),
 			streamPut: root ? (path) => this.streamPut(dav, root, path) : undefined,
-			streamGet: root ? (path) => this.streamGet(dav, root, path) : undefined,
+			streamGet: root ? (path, file) => this.streamGet(dav, root, path, file) : undefined,
 		};
 	}
 
@@ -187,22 +190,30 @@ export default class SyncUpNotesPlugin extends Plugin {
 	}
 
 	private async streamPut(dav: WebDav, root: { modules: NodeModules; base: string }, vaultPath: string): Promise<{ etag: string }> {
-		const etag = await streamUpload(root.modules, vaultFile(root.modules, root.base, vaultPath), dav.fileURL(vaultPath), {
-			Authorization: dav.authHeader(),
-		});
+		const etag = await streamUpload(
+			root.modules,
+			vaultFile(root.modules, root.base, vaultPath),
+			dav.fileURL(vaultPath),
+			{ Authorization: dav.authHeader() },
+			this.serverResume,
+		);
 		return { etag };
 	}
 
-	private async streamGet(dav: WebDav, root: { modules: NodeModules; base: string }, vaultPath: string): Promise<{ size: number; mtime: number; etag: string }> {
+	private async streamGet(dav: WebDav, root: { modules: NodeModules; base: string }, vaultPath: string, file: { etag: string; size: number }): Promise<{ size: number; mtime: number; etag: string }> {
 		this.applying = true;
+		const partial = partialFile(root.modules, root.base, vaultPath);
 		try {
+			const offset = preparePartial(root.modules, partial, file.etag, file.size);
 			const etag = await streamDownload(
 				root.modules,
 				vaultFile(root.modules, root.base, vaultPath),
-				partialFile(root.modules, root.base, vaultPath),
+				partial,
 				dav.fileURL(vaultPath),
 				{ Authorization: dav.authHeader() },
+				offset,
 			);
+			forgetPartialMeta(root.modules, partial);
 			for (let attempt = 0; attempt < 50; attempt++) {
 				const found = this.app.vault.getAbstractFileByPath(vaultPath);
 				if (found instanceof TFile) return { size: found.stat.size, mtime: found.stat.mtime, etag };
@@ -394,6 +405,36 @@ export default class SyncUpNotesPlugin extends Plugin {
 			this.saveTimer = null;
 			void this.sync();
 		}, SAVE_DELAY_MS);
+	}
+
+	private noteFailures(failed: { path: string; key: string }[], transferred: string[]): boolean {
+		const retries: Record<string, TransferAttempt> = { ...this.settings.retries };
+		let changed = false;
+		let paused = false;
+		let retrying = false;
+		for (const path of transferred) {
+			if (!retries[path]) continue;
+			delete retries[path];
+			changed = true;
+		}
+		for (const fail of failed) {
+			const prior = retries[fail.path];
+			const attempts = prior && prior.key === fail.key ? prior.attempts + 1 : 1;
+			retries[fail.path] = { attempts, key: fail.key };
+			changed = true;
+			if (attempts < MAX_TRANSFER_ATTEMPTS) {
+				retrying = true;
+				continue;
+			}
+			paused = true;
+			const name = fail.path.split("/").pop() || fail.path;
+			new Notice(`SyncUp Notes: stopped retrying ${name} after ${MAX_TRANSFER_ATTEMPTS} failed attempts. It will try again when the file changes.`);
+		}
+		if (changed) {
+			this.settings.retries = retries;
+			void this.saveSettings();
+		}
+		return paused && !retrying;
 	}
 
 	private showProgress(update: SyncProgress) {
