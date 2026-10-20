@@ -27,6 +27,13 @@ export class QuotaError extends Error {
 	}
 }
 
+export class ConflictError extends Error {
+	constructor() {
+		super("conflict");
+		this.name = "ConflictError";
+	}
+}
+
 export class TooLargeError extends Error {
 	readonly limit: number;
 
@@ -76,8 +83,10 @@ export class WebDav {
 		};
 	}
 
-	async put(path: string, body: Uint8Array): Promise<{ etag: string }> {
-		const response = await this.request("PUT", fileUrl(this.config, path), {}, body);
+	async put(path: string, body: Uint8Array, match?: string): Promise<{ etag: string }> {
+		const headers: Record<string, string> = {};
+		if (match) headers["If-Match"] = `"${match}"`;
+		const response = await this.request("PUT", fileUrl(this.config, path), headers, body);
 		return { etag: cleanEtag(header(response.headers, "etag")) };
 	}
 
@@ -88,6 +97,13 @@ export class WebDav {
 
 	async remove(path: string): Promise<void> {
 		await this.request("DELETE", fileUrl(this.config, path));
+	}
+
+	async move(from: string, to: string): Promise<void> {
+		await this.request("MOVE", fileUrl(this.config, from), {
+			Destination: fileUrl(this.config, to),
+			Overwrite: "F",
+		});
 	}
 
 	fileURL(path: string): string {
@@ -107,6 +123,7 @@ export class WebDav {
 		});
 		if (response.status === 401 || response.status === 403) throw new AuthError();
 		if (response.status === 507) throw new QuotaError();
+		if (response.status === 412) throw new ConflictError();
 		if (response.status === 413) throw new TooLargeError(limitBytes(header(response.headers, "x-syncup-file-limit")));
 		if (response.status >= 400) throw new Error(`webdav ${response.status}`);
 		return response;

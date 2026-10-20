@@ -143,6 +143,12 @@ export default class SyncUpNotesPlugin extends Plugin {
 			new Notice("SyncUp Notes: storage is full");
 			return true;
 		}
+		if (result.conflicts.length === 1) {
+			const name = result.conflicts[0].split("/").pop() || result.conflicts[0];
+			new Notice(`SyncUp Notes: kept your edit as ${name}`);
+		} else if (result.conflicts.length > 1) {
+			new Notice(`SyncUp Notes: kept ${result.conflicts.length} edits next to the newer server copies`);
+		}
 		if (result.skipped.length > 0) {
 			const limit = result.fileLimit ?? listing.fileLimit;
 			new Notice(`SyncUp Notes: ${overLimitNotice(result.skipped, limit)}`);
@@ -171,11 +177,12 @@ export default class SyncUpNotesPlugin extends Plugin {
 			read: (path) => this.readFile(path),
 			write: (path, body) => this.writeFile(path, body),
 			removeLocal: (path) => this.removeFile(path),
-			put: (path, body) => dav.put(path, body),
+			put: (path, body, match) => dav.put(path, body, match),
 			get: (path) => dav.get(path),
 			removeRemote: (path) => dav.remove(path),
+			move: (from, to) => dav.move(from, to),
 			stat: async (path) => this.statFile(path),
-			streamPut: root ? (path) => this.streamPut(dav, root, path) : undefined,
+			streamPut: root ? (path, match) => this.streamPut(dav, root, path, match) : undefined,
 			streamGet: root ? (path, file) => this.streamGet(dav, root, path, file) : undefined,
 		};
 	}
@@ -189,14 +196,10 @@ export default class SyncUpNotesPlugin extends Plugin {
 		return { modules, base: adapter.getBasePath() };
 	}
 
-	private async streamPut(dav: WebDav, root: { modules: NodeModules; base: string }, vaultPath: string): Promise<{ etag: string }> {
-		const etag = await streamUpload(
-			root.modules,
-			vaultFile(root.modules, root.base, vaultPath),
-			dav.fileURL(vaultPath),
-			{ Authorization: dav.authHeader() },
-			this.serverResume,
-		);
+	private async streamPut(dav: WebDav, root: { modules: NodeModules; base: string }, vaultPath: string, match?: string): Promise<{ etag: string }> {
+		const headers: Record<string, string> = { Authorization: dav.authHeader() };
+		if (match) headers["If-Match"] = `"${match}"`;
+		const etag = await streamUpload(root.modules, vaultFile(root.modules, root.base, vaultPath), dav.fileURL(vaultPath), headers, this.serverResume);
 		return { etag };
 	}
 

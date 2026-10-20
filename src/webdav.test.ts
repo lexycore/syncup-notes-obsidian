@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AuthError, QuotaError, TooLargeError, WebDav, filesFromPropfind, type HttpResponse } from "./webdav.ts";
+import { AuthError, ConflictError, QuotaError, TooLargeError, WebDav, filesFromPropfind, type HttpResponse } from "./webdav.ts";
 
 const xml = `<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:">
@@ -45,9 +45,9 @@ test("list sends one infinity propfind with basic auth", async () => {
 });
 
 test("put and delete use the encoded vault path", async () => {
-	const seen: { method: string; url: string; body?: Uint8Array }[] = [];
+	const seen: { method: string; url: string; body?: Uint8Array; headers: Record<string, string> }[] = [];
 	const dav = new WebDav(async (request) => {
-		seen.push({ method: request.method, url: request.url, body: request.body });
+		seen.push({ method: request.method, url: request.url, body: request.body, headers: request.headers });
 		if (request.method === "GET") return { status: 200, headers: { etag: '"abc"' }, body: new Uint8Array([1, 2, 3]) };
 		return { status: request.method === "PUT" ? 201 : 204, headers: { etag: '"def"' }, body: new Uint8Array() };
 	}, { server: "https://syncup.ru/webdav", folder: "alkov", username: "a@b.c", password: "s" });
@@ -61,6 +61,24 @@ test("put and delete use the encoded vault path", async () => {
 	assert.deepEqual(got.body, new Uint8Array([1, 2, 3]));
 	await dav.remove("notes/hello world.md");
 	assert.equal(seen[2].method, "DELETE");
+	await dav.move("_Archive/Ref", "_Archive/Reforma");
+	assert.equal(seen[3].method, "MOVE");
+	assert.equal(seen[3].url, "https://syncup.ru/webdav/alkov/_Archive/Ref");
+	assert.equal(seen[3].headers.Destination, "https://syncup.ru/webdav/alkov/_Archive/Reforma");
+	assert.equal(seen[3].headers.Overwrite, "F");
+});
+
+test("put sends the ancestor etag and a mismatch is a conflict", async () => {
+	let calls = 0;
+	const dav = new WebDav(async (request) => {
+		calls += 1;
+		assert.equal(request.headers["If-Match"], calls === 1 ? '"current"' : '"stale"');
+		if (calls === 1) return { status: 204, headers: { etag: '"next"' }, body: new Uint8Array() };
+		return text(412, "precondition failed");
+	}, { server: "https://syncup.ru/webdav", folder: "alkov", username: "a@b.c", password: "s" });
+	const put = await dav.put("a.md", new Uint8Array([1]), "current");
+	assert.equal(put.etag, "next");
+	await assert.rejects(dav.put("a.md", new Uint8Array([1]), "stale"), ConflictError);
 });
 
 test("auth, quota, and size errors are distinct", async () => {

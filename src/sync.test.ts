@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
 import { execute, type SyncIO } from "./sync.ts";
-import { QuotaError, TooLargeError } from "./webdav.ts";
+import { ConflictError, QuotaError, TooLargeError } from "./webdav.ts";
 
 test("an upload records the server etag and the local mtime", async () => {
 	const baseline: Record<string, BaselineEntry> = {};
@@ -47,6 +47,84 @@ test("a desktop download streams instead of buffering the file", async () => {
 	assert.equal(result.baseline["a.md"].etag, "e");
 	assert.deepEqual(result.failed, []);
 	assert.deepEqual(result.transferred, ["a.md"]);
+});
+
+test("a move drops the old baseline entry and keeps the etag on the new path", async () => {
+	let moved = "";
+	const io = fake({
+		move: async (from, to) => {
+			moved = `${from} -> ${to}`;
+		},
+	});
+	const result = await execute(
+		[{
+			type: "move",
+			from: "_Archive/Ref",
+			path: "_Archive/Reforma",
+			files: [
+				{ from: "_Archive/Ref/a.md", path: "_Archive/Reforma/a.md", etag: "a", size: 4, mtime: 8, changed: false },
+				{ from: "_Archive/Ref/b.md", path: "_Archive/Reforma/b.md", etag: "b", size: 9, mtime: 8, changed: true },
+			],
+		}],
+		io,
+		{ "_Archive/Ref/a.md": { size: 4, mtime: 2, etag: "a" }, "_Archive/Ref/b.md": { size: 5, mtime: 2, etag: "b" } },
+	);
+	assert.equal(moved, "_Archive/Ref -> _Archive/Reforma");
+	assert.equal(result.baseline["_Archive/Ref/a.md"], undefined);
+	assert.deepEqual(result.baseline["_Archive/Reforma/a.md"], { size: 4, mtime: 8, etag: "a" });
+	assert.equal(result.baseline["_Archive/Reforma/b.md"], undefined);
+});
+
+test("a conflict keeps the local edit beside the newer server file", async () => {
+	const writes: string[] = [];
+	const io = fake({
+		read: async () => new Uint8Array([1, 1]),
+		get: async () => ({ body: new Uint8Array([2]), etag: "server" }),
+		write: async (path) => {
+			writes.push(path);
+			return { size: 1, mtime: 9 };
+		},
+		put: async (path, _body, match) => {
+			assert.equal(match, undefined);
+			assert.equal(path, "Note (conflict).md");
+			return { etag: "copy" };
+		},
+		stat: async (path) => {
+			if (path.includes("conflict")) throw new Error("missing");
+			return { size: 1, mtime: 1 };
+		},
+	});
+	const result = await execute([{ type: "conflict", path: "Note.md", etag: "server" }], io, {
+		"Note.md": { size: 1, mtime: 1, etag: "old" },
+	});
+	assert.deepEqual(writes, ["Note (conflict).md", "Note.md"]);
+	assert.equal(result.baseline["Note.md"].etag, "server");
+	assert.equal(result.baseline["Note (conflict).md"].etag, "copy");
+	assert.deepEqual(result.conflicts, ["Note (conflict).md"]);
+	assert.deepEqual(result.errors, []);
+});
+
+test("a stale upload is refused and cannot replace the server file", async () => {
+	const io = fake({
+		read: async () => new Uint8Array([9]),
+		put: async (path, _body, match) => {
+			if (path === "a.md") {
+				assert.equal(match, "old");
+				throw new ConflictError();
+			}
+			return { etag: "copy" };
+		},
+		get: async () => ({ body: new Uint8Array([2]), etag: "new" }),
+		write: async () => ({ size: 1, mtime: 4 }),
+		stat: async (path) => {
+			if (path.includes("conflict")) throw new Error("missing");
+			return { size: 1, mtime: 4 };
+		},
+	});
+	const result = await execute([{ type: "upload", path: "a.md", match: "old" }], io, {});
+	assert.equal(result.baseline["a.md"].etag, "new");
+	assert.equal(result.baseline["a (conflict).md"].etag, "copy");
+	assert.deepEqual(result.errors, []);
 });
 
 test("a download writes the body and keeps the new local mtime", async () => {
@@ -126,6 +204,7 @@ function fake(impl: Partial<SyncIO>): SyncIO {
 		put: async () => ({ etag: "" }),
 		get: async () => ({ body: new Uint8Array(), etag: "" }),
 		removeRemote: async () => {},
+		move: async () => {},
 		stat: async () => ({ size: 0, mtime: 0 }),
 		...impl,
 	};

@@ -1,4 +1,4 @@
-import { AuthError, QuotaError, TooLargeError, cleanEtag, limitBytes } from "./webdav.ts";
+import { AuthError, ConflictError, QuotaError, TooLargeError, cleanEtag, limitBytes } from "./webdav.ts";
 
 declare function require(id: string): unknown;
 
@@ -234,6 +234,7 @@ function settle(res: Incoming, resolve: (etag: string) => void, reject: (error: 
 function statusError(status: number, headers?: Record<string, string | string[] | undefined>): Error | null {
 	if (status === 401 || status === 403) return new AuthError();
 	if (status === 507) return new QuotaError();
+	if (status === 412) return new ConflictError();
 	if (status === 413) return new TooLargeError(limitBytes(oneHeader(headers ?? {}, "x-syncup-file-limit")));
 	if (status >= 400) return new Error(`webdav ${status}`);
 	return null;

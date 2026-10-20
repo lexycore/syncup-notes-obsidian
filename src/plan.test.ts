@@ -56,7 +56,7 @@ test("downloads when only the remote file changed", () => {
 	assert.deepEqual(types(actions), ["download a.md"]);
 });
 
-test("newer side wins when both changed", () => {
+test("both sides changed keeps the server file and does not use mtime", () => {
 	const baseline = { "a.md": base(3, 5_000, "aaa") };
 	const localWins = planSync({
 		local: [local("a.md", 9, 20_000)],
@@ -68,8 +68,8 @@ test("newer side wins when both changed", () => {
 		remote: [remote("a.md", 8, 20_000, "new")],
 		baseline,
 	});
-	assert.deepEqual(types(localWins), ["upload a.md"]);
-	assert.deepEqual(types(remoteWins), ["download a.md"]);
+	assert.deepEqual(types(localWins), ["conflict a.md"]);
+	assert.deepEqual(types(remoteWins), ["conflict a.md"]);
 });
 
 test("deletes the remote file when it was removed locally and the server copy is unchanged", () => {
@@ -79,6 +79,41 @@ test("deletes the remote file when it was removed locally and the server copy is
 		baseline: { "gone.md": base(3, 5_000, "aaa") },
 	});
 	assert.deepEqual(types(actions), ["delete-remote gone.md"]);
+});
+
+test("renaming a file moves it instead of deleting the old name", () => {
+	const actions = planSync({
+		local: [local("TG/tg-alkovpro/2026/2026-10/+2026-10-20-SyncUp-Notes.md", 120, 9_000)],
+		remote: [remote("TG/tg-alkovpro/2026/2026-10/2026-10-20-SyncUp-Notes.md", 120, 5_000, "note")],
+		baseline: { "TG/tg-alkovpro/2026/2026-10/2026-10-20-SyncUp-Notes.md": base(120, 5_000, "note") },
+	});
+	assert.equal(actions.length, 1);
+	assert.equal(actions[0].type, "move");
+	if (actions[0].type !== "move") return;
+	assert.equal(actions[0].from, "TG/tg-alkovpro/2026/2026-10/2026-10-20-SyncUp-Notes.md");
+	assert.equal(actions[0].path, "TG/tg-alkovpro/2026/2026-10/+2026-10-20-SyncUp-Notes.md");
+	assert.equal(deleteCount(actions), 0);
+});
+
+test("renaming a folder moves the whole tree", () => {
+	const actions = planSync({
+		local: [local("_Archive/Reforma/a.md", 4, 8_000), local("_Archive/Reforma/sub/b.md", 5, 8_000), local("keep.md", 1, 1)],
+		remote: [remote("_Archive/Ref/a.md", 4, 2_000, "a"), remote("_Archive/Ref/sub/b.md", 5, 2_000, "b"), remote("keep.md", 1, 1, "k")],
+		baseline: {
+			"_Archive/Ref/a.md": base(4, 2_000, "a"),
+			"_Archive/Ref/sub/b.md": base(5, 2_000, "b"),
+			"keep.md": base(1, 1, "k"),
+		},
+	});
+	assert.equal(actions.filter((action) => action.type === "move").length, 1);
+	const move = actions.find((action) => action.type === "move");
+	assert.ok(move && move.type === "move");
+	if (move?.type !== "move") return;
+	assert.equal(move.from, "_Archive/Ref");
+	assert.equal(move.path, "_Archive/Reforma");
+	assert.deepEqual(move.files.map((file) => file.path).sort(), ["_Archive/Reforma/a.md", "_Archive/Reforma/sub/b.md"]);
+	assert.equal(deleteCount(actions), 0);
+	assert.deepEqual(types(actions).filter((line) => line.startsWith("upload") || line.startsWith("delete")), []);
 });
 
 test("deletes the local file when it was removed on the server and the local copy is unchanged", () => {

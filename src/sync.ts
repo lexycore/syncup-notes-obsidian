@@ -1,15 +1,16 @@
 import { MAX_UPLOAD_BYTES, transferKey, type Action, type BaselineEntry } from "./plan.ts";
-import { AuthError, QuotaError, TooLargeError } from "./webdav.ts";
+import { AuthError, ConflictError, QuotaError, TooLargeError } from "./webdav.ts";
 
 export interface SyncIO {
 	read(path: string): Promise<Uint8Array>;
 	write(path: string, body: Uint8Array): Promise<{ size: number; mtime: number }>;
 	removeLocal(path: string): Promise<void>;
-	put(path: string, body: Uint8Array): Promise<{ etag: string }>;
+	put(path: string, body: Uint8Array, match?: string): Promise<{ etag: string }>;
 	get(path: string): Promise<{ body: Uint8Array; etag: string }>;
-	streamPut?(path: string): Promise<{ etag: string }>;
+	streamPut?(path: string, match?: string): Promise<{ etag: string }>;
 	streamGet?(path: string, file: { etag: string; size: number }): Promise<{ size: number; mtime: number; etag: string }>;
 	removeRemote(path: string): Promise<void>;
+	move(from: string, to: string): Promise<void>;
 	stat(path: string): Promise<{ size: number; mtime: number }>;
 }
 
@@ -31,6 +32,7 @@ export async function execute(
 	failed: { path: string; key: string }[];
 	transferred: string[];
 	fileLimit?: number;
+	conflicts: string[];
 	abort?: "auth" | "quota";
 }> {
 	const next = { ...baseline };
@@ -38,6 +40,7 @@ export async function execute(
 	const errors: string[] = [];
 	const failed: { path: string; key: string }[] = [];
 	const transferred: string[] = [];
+	const conflicts: string[] = [];
 	let fileLimit: number | undefined;
 	const work = actions.filter((action) => action.type !== "unchanged" && action.type !== "forget" && action.type !== "paused");
 	let done = 0;
@@ -55,12 +58,12 @@ export async function execute(
 		progress?.({ done, total: work.length, action });
 		await yieldToUI();
 		try {
-			await apply(action, io, next);
+			await apply(action, io, next, conflicts);
 			if (action.type === "upload" || action.type === "download") transferred.push(action.path);
 			if (action.type === "skip-large") skipped.push(action.path);
 		} catch (error) {
-			if (error instanceof AuthError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, abort: "auth" };
-			if (error instanceof QuotaError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, abort: "quota" };
+			if (error instanceof AuthError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, abort: "auth" };
+			if (error instanceof QuotaError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, abort: "quota" };
 			if (error instanceof TooLargeError && error.limit > 0) {
 				skipped.push(action.path);
 				fileLimit = error.limit;
@@ -70,25 +73,39 @@ export async function execute(
 			if (action.type === "upload" || action.type === "download") failed.push({ path: action.path, key: transferKey(action.type, action) });
 		}
 	}
-	return { baseline: next, skipped, errors, failed, transferred, fileLimit };
+	return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts };
 }
 
-async function apply(action: Action, io: SyncIO, baseline: Record<string, BaselineEntry>): Promise<void> {
+async function apply(action: Action, io: SyncIO, baseline: Record<string, BaselineEntry>, conflicts: string[]): Promise<void> {
 	switch (action.type) {
 		case "upload": {
 			if ((action.size ?? 0) > MAX_UPLOAD_BYTES && !io.streamPut) {
 				throw new Error("open the desktop app to upload files over 64 MB");
 			}
 			if (io.streamPut && (action.size ?? 0) > MAX_UPLOAD_BYTES) {
-				const put = await io.streamPut(action.path);
-				const stat = await io.stat(action.path);
-				baseline[action.path] = { size: stat.size, mtime: stat.mtime, etag: put.etag };
+				try {
+					const put = await io.streamPut(action.path, action.match);
+					const stat = await io.stat(action.path);
+					baseline[action.path] = { size: stat.size, mtime: stat.mtime, etag: put.etag };
+				} catch (error) {
+					if (!(error instanceof ConflictError) || !action.match) throw error;
+					await keepLocalCopy(action.path, await io.read(action.path), io, baseline, conflicts);
+				}
 				return;
 			}
 			const body = await io.read(action.path);
-			const put = await io.put(action.path, body);
-			const stat = await io.stat(action.path);
-			baseline[action.path] = { size: stat.size, mtime: stat.mtime, etag: put.etag };
+			try {
+				const put = await io.put(action.path, body, action.match);
+				const stat = await io.stat(action.path);
+				baseline[action.path] = { size: stat.size, mtime: stat.mtime, etag: put.etag };
+			} catch (error) {
+				if (!(error instanceof ConflictError) || !action.match) throw error;
+				await keepLocalCopy(action.path, body, io, baseline, conflicts);
+			}
+			return;
+		}
+		case "conflict": {
+			await keepLocalCopy(action.path, await io.read(action.path), io, baseline, conflicts);
 			return;
 		}
 		case "download": {
@@ -109,9 +126,64 @@ async function apply(action: Action, io: SyncIO, baseline: Record<string, Baseli
 			await io.removeRemote(action.path);
 			delete baseline[action.path];
 			return;
+		case "move":
+			await io.move(action.from, action.path);
+			for (const file of action.files) {
+				delete baseline[file.from];
+				if (!file.changed) baseline[file.path] = { size: file.size, mtime: file.mtime, etag: file.etag };
+			}
+			return;
 		default:
 			return;
 	}
+}
+
+async function keepLocalCopy(path: string, localBody: Uint8Array, io: SyncIO, baseline: Record<string, BaselineEntry>, conflicts: string[]): Promise<void> {
+	let server: { body: Uint8Array; etag: string } | null = null;
+	try {
+		server = await io.get(path);
+	} catch (error) {
+		if (!gone(error)) throw error;
+	}
+	const copy = await unusedCopy(path, io);
+	const saved = await io.write(copy, localBody);
+	const put = await io.put(copy, localBody);
+	baseline[copy] = { size: saved.size, mtime: saved.mtime, etag: put.etag };
+	conflicts.push(copy);
+	if (!server) {
+		await io.removeLocal(path);
+		delete baseline[path];
+		return;
+	}
+	const written = await io.write(path, server.body);
+	baseline[path] = { size: written.size, mtime: written.mtime, etag: server.etag };
+}
+
+async function unusedCopy(path: string, io: SyncIO): Promise<string> {
+	for (let n = 1; n < 50; n++) {
+		const candidate = conflictName(path, n);
+		try {
+			await io.stat(candidate);
+		} catch {
+			return candidate;
+		}
+	}
+	throw new Error(`conflict name for ${path}`);
+}
+
+function conflictName(path: string, n: number): string {
+	const slash = path.lastIndexOf("/");
+	const dir = slash === -1 ? "" : path.slice(0, slash + 1);
+	const base = slash === -1 ? path : path.slice(slash + 1);
+	const dot = base.lastIndexOf(".");
+	const stem = dot > 0 ? base.slice(0, dot) : base;
+	const ext = dot > 0 ? base.slice(dot) : "";
+	const suffix = n === 1 ? " (conflict)" : ` (conflict ${n})`;
+	return `${dir}${stem}${suffix}${ext}`;
+}
+
+function gone(error: unknown): boolean {
+	return error instanceof Error && error.message === "webdav 404";
 }
 
 function yieldToUI(): Promise<void> {
