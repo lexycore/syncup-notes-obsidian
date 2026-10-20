@@ -75,7 +75,10 @@ export function vaultFile(modules: NodeModules, base: string, vaultPath: string)
 }
 
 export function partialFile(modules: NodeModules, base: string, vaultPath: string): string {
-	return modules.path.join(modules.path.resolve(base), ".syncup", "partial", encodeURIComponent(vaultPath));
+	// One encoded filename exceeds NAME_MAX once the vault path contains Cyrillic.
+	// Mirror the vault path so each component stays as short as the real file.
+	const staging = modules.path.join(modules.path.resolve(base), ".syncup", "partial");
+	return vaultFile(modules, staging, vaultPath);
 }
 
 export function streamUpload(modules: NodeModules, file: string, url: string, headers: Record<string, string>): Promise<string> {

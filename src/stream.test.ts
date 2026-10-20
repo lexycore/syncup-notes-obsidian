@@ -11,8 +11,12 @@ const modules = { fs, http, https: http, path } as unknown as NodeModules;
 test("a vault path cannot escape the vault directory", () => {
 	const base = fs.mkdtempSync(path.join(os.tmpdir(), "syncup-vault-"));
 	assert.equal(vaultFile(modules, base, "notes/a.md"), path.join(base, "notes", "a.md"));
-	assert.equal(path.dirname(partialFile(modules, base, "notes/a.md")), path.join(base, ".syncup", "partial"));
+	const vaultPath = "Импульс/speakers/Олег Маковельский/2026-08-26/Impulse - Олег Дмитрий.mp4";
+	const partial = partialFile(modules, base, vaultPath);
+	assert.equal(partial, path.join(base, ".syncup", "partial", ...vaultPath.split("/")));
+	assert.ok(Buffer.byteLength(path.basename(partial)) <= 255);
 	assert.throws(() => vaultFile(modules, base, "../outside.txt"));
+	assert.throws(() => partialFile(modules, base, "../outside.txt"));
 	fs.rmSync(base, { recursive: true, force: true });
 });
 
