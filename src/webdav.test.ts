@@ -81,6 +81,17 @@ test("put sends the ancestor etag and a mismatch is a conflict", async () => {
 	await assert.rejects(dav.put("a.md", new Uint8Array([1]), "stale"), ConflictError);
 });
 
+test("a range download asks only for the next bytes", async () => {
+	let range = "";
+	const dav = new WebDav(async (request) => {
+		range = request.headers.Range ?? "";
+		return { status: 206, headers: { etag: '"e"' }, body: new Uint8Array([1, 2, 3]) };
+	}, { server: "https://syncup.ru/webdav", folder: "", username: "a@b.c", password: "s" });
+	const body = await dav.getRange("clip.mp4", 8, 10);
+	assert.equal(range, "bytes=8-10");
+	assert.equal(body.byteLength, 3);
+});
+
 test("auth, quota, and size errors are distinct", async () => {
 	const dav = (status: number) => new WebDav(async () => text(status, "nope"), {
 		server: "https://syncup.ru/webdav", folder: "", username: "a@b.c", password: "s",

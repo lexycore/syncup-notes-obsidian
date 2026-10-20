@@ -95,6 +95,13 @@ export class WebDav {
 		return { body: response.body, etag: cleanEtag(header(response.headers, "etag")) };
 	}
 
+	async getRange(path: string, start: number, end: number): Promise<Uint8Array> {
+		const response = await this.request("GET", fileUrl(this.config, path), { Range: `bytes=${start}-${end}` });
+		const expected = end - start + 1;
+		if (response.body.byteLength !== expected) throw new Error(`webdav range ${start}-${end}`);
+		return response.body;
+	}
+
 	async remove(path: string): Promise<void> {
 		await this.request("DELETE", fileUrl(this.config, path));
 	}

@@ -27,6 +27,11 @@ export interface TransferAttempt {
 	key: string;
 }
 
+export interface OverLimit {
+	limit: number;
+	paths: string[];
+}
+
 export interface MovedFile {
 	from: string;
 	path: string;
@@ -44,21 +49,23 @@ export type Action =
 	| { type: "delete-remote"; path: string }
 	| { type: "move"; from: string; path: string; files: MovedFile[] }
 	| { type: "skip-large"; path: string }
+	| { type: "parked"; path: string }
 	| { type: "paused"; path: string }
 	| { type: "unchanged"; path: string; etag: string; size: number; mtime: number }
 	| { type: "forget"; path: string };
 
 const ORDER: Record<Action["type"], number> = {
 	move: 0,
-	"delete-remote": 1,
-	"delete-local": 2,
-	conflict: 3,
-	download: 4,
-	upload: 5,
+	upload: 1,
+	conflict: 2,
+	download: 3,
+	"delete-remote": 4,
+	"delete-local": 5,
 	"skip-large": 6,
-	unchanged: 7,
-	paused: 8,
-	forget: 9,
+	parked: 7,
+	unchanged: 8,
+	paused: 9,
+	forget: 10,
 };
 
 export function transferKey(op: "upload" | "download", file: { size?: number; mtime?: number; etag?: string }): string {
@@ -92,17 +99,19 @@ export function planSync(input: {
 	baseline: Record<string, BaselineEntry>;
 	fileLimit?: number;
 	attempts?: Record<string, TransferAttempt>;
+	overLimit?: OverLimit;
 }): Action[] {
 	const locals = new Map(input.local.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const remotes = new Map(input.remote.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const paths = new Set<string>([...locals.keys(), ...remotes.keys(), ...Object.keys(input.baseline)]);
+	const parked = input.overLimit && input.fileLimit === input.overLimit.limit ? new Set(input.overLimit.paths) : undefined;
 	const actions: Action[] = [];
 	for (const path of paths) {
-		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path], input.fileLimit);
+		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path], input.fileLimit, parked);
 		if (action) actions.push(pauseTransfer(action, input.attempts));
 	}
 	const renamed = rewriteRenames(actions, locals, remotes, input.baseline);
-	renamed.sort((a, b) => ORDER[a.type] - ORDER[b.type] || a.path.localeCompare(b.path));
+	renamed.sort((a, b) => ORDER[a.type] - ORDER[b.type] || actionSize(a) - actionSize(b) || a.path.localeCompare(b.path));
 	return renamed;
 }
 
@@ -112,27 +121,28 @@ function decide(
 	remote?: RemoteFile,
 	prior?: BaselineEntry,
 	fileLimit?: number,
+	parked?: Set<string>,
 ): Action | null {
 	if (!local && !remote) return prior ? { type: "forget", path } : null;
-	if (!prior) return firstSight(path, local, remote, fileLimit);
+	if (!prior) return firstSight(path, local, remote, fileLimit, parked);
 	const localChanged = local !== undefined && (local.size !== prior.size || local.mtime !== prior.mtime);
 	const remoteChanged = remote !== undefined && remote.etag !== prior.etag;
 	if (local && remote) {
 		if (!localChanged && !remoteChanged) return unchanged(path, local, remote);
-		if (localChanged && !remoteChanged) return uploadOrSkip(path, local, fileLimit, prior.etag);
+		if (localChanged && !remoteChanged) return uploadOrSkip(path, local, fileLimit, parked, prior.etag);
 		if (!localChanged && remoteChanged) return download(remote);
 		return { type: "conflict", path, etag: remote.etag, size: remote.size };
 	}
-	if (local) return localChanged ? uploadOrSkip(path, local, fileLimit, prior.etag) : { type: "delete-local", path };
+	if (local) return localChanged ? uploadOrSkip(path, local, fileLimit, parked, prior.etag) : { type: "delete-local", path };
 	return remote && remoteChanged ? download(remote) : { type: "delete-remote", path };
 }
 
-function firstSight(path: string, local?: LocalFile, remote?: RemoteFile, fileLimit?: number): Action {
+function firstSight(path: string, local?: LocalFile, remote?: RemoteFile, fileLimit?: number, parked?: Set<string>): Action {
 	if (local && remote) {
 		if (local.size === remote.size) return unchanged(path, local, remote);
-		return newer(local, remote) === "local" ? uploadOrSkip(path, local, fileLimit) : download(remote);
+		return newer(local, remote) === "local" ? uploadOrSkip(path, local, fileLimit, parked) : download(remote);
 	}
-	if (local) return uploadOrSkip(path, local, fileLimit);
+	if (local) return uploadOrSkip(path, local, fileLimit, parked);
 	if (remote) return download(remote);
 	return { type: "download", path };
 }
@@ -141,8 +151,10 @@ function download(remote: RemoteFile): Action {
 	return { type: "download", path: remote.path, size: remote.size, etag: remote.etag };
 }
 
-function uploadOrSkip(path: string, local: LocalFile, fileLimit?: number, match?: string): Action {
-	if (fileLimit !== undefined && local.size > fileLimit) return { type: "skip-large", path };
+function uploadOrSkip(path: string, local: LocalFile, fileLimit?: number, parked?: Set<string>, match?: string): Action {
+	if (fileLimit !== undefined && local.size > fileLimit) {
+		return parked?.has(path) ? { type: "parked", path } : { type: "skip-large", path };
+	}
 	const upload: Action = { type: "upload", path, size: local.size, mtime: local.mtime };
 	if (!match || upload.type !== "upload") return upload;
 	return { ...upload, match };
@@ -154,6 +166,12 @@ function pauseTransfer(action: Action, attempts?: Record<string, TransferAttempt
 	const prior = attempts[action.path];
 	if (prior && prior.key === key && prior.attempts >= MAX_TRANSFER_ATTEMPTS) return { type: "paused", path: action.path };
 	return action;
+}
+
+export function nextOverLimit(limit: number | undefined, parked: string[], skipped: string[], prior?: OverLimit): OverLimit | undefined {
+	if (limit === undefined) return prior;
+	const paths = [...new Set([...parked, ...skipped])].sort();
+	return { limit, paths };
 }
 
 export function overLimitNotice(paths: string[], fileLimit?: number): string {
@@ -345,6 +363,12 @@ function splitPrefix(oldPath: string, newPath: string): { from: string; to: stri
 	const to = newParts.slice(0, newEnd + 1).join("/");
 	if (!from || !to || from === to) return null;
 	return { from, to };
+}
+
+function actionSize(action: Action): number {
+	if (action.type === "upload" || action.type === "download" || action.type === "conflict") return action.size ?? 0;
+	if (action.type === "move") return action.files.reduce((sum, file) => sum + file.size, 0);
+	return 0;
 }
 
 function baseName(path: string): string {

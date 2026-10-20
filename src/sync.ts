@@ -1,3 +1,4 @@
+import { CHUNK_BYTES } from "./chunks.ts";
 import { MAX_UPLOAD_BYTES, transferKey, type Action, type BaselineEntry } from "./plan.ts";
 import { AuthError, ConflictError, QuotaError, TooLargeError } from "./webdav.ts";
 
@@ -9,6 +10,7 @@ export interface SyncIO {
 	get(path: string): Promise<{ body: Uint8Array; etag: string }>;
 	streamPut?(path: string, match?: string): Promise<{ etag: string }>;
 	streamGet?(path: string, file: { etag: string; size: number }): Promise<{ size: number; mtime: number; etag: string }>;
+	pull?(path: string, file: { etag: string; size: number }): Promise<{ size: number; mtime: number; etag: string }>;
 	removeRemote(path: string): Promise<void>;
 	move(from: string, to: string): Promise<void>;
 	stat(path: string): Promise<{ size: number; mtime: number }>;
@@ -20,11 +22,14 @@ export interface SyncProgress {
 	action: Action;
 }
 
+const SAVED = new Set<Action["type"]>(["upload", "download", "conflict", "delete-local", "delete-remote", "move", "forget"]);
+
 export async function execute(
 	actions: Action[],
 	io: SyncIO,
 	baseline: Record<string, BaselineEntry>,
 	progress?: (update: SyncProgress) => void,
+	checkpoint?: (baseline: Record<string, BaselineEntry>) => Promise<void>,
 ): Promise<{
 	baseline: Record<string, BaselineEntry>;
 	skipped: string[];
@@ -42,7 +47,7 @@ export async function execute(
 	const transferred: string[] = [];
 	const conflicts: string[] = [];
 	let fileLimit: number | undefined;
-	const work = actions.filter((action) => action.type !== "unchanged" && action.type !== "forget" && action.type !== "paused");
+	const work = actions.filter((action) => action.type !== "unchanged" && action.type !== "forget" && action.type !== "paused" && action.type !== "parked");
 	let done = 0;
 	for (const action of actions) {
 		if (action.type === "unchanged") {
@@ -51,9 +56,10 @@ export async function execute(
 		}
 		if (action.type === "forget") {
 			delete next[action.path];
+			if (checkpoint) await checkpoint(next);
 			continue;
 		}
-		if (action.type === "paused") continue;
+		if (action.type === "paused" || action.type === "parked") continue;
 		done += 1;
 		progress?.({ done, total: work.length, action });
 		await yieldToUI();
@@ -61,6 +67,7 @@ export async function execute(
 			await apply(action, io, next, conflicts);
 			if (action.type === "upload" || action.type === "download") transferred.push(action.path);
 			if (action.type === "skip-large") skipped.push(action.path);
+			if (SAVED.has(action.type) && checkpoint) await checkpoint(next);
 		} catch (error) {
 			if (error instanceof AuthError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, abort: "auth" };
 			if (error instanceof QuotaError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, abort: "quota" };
@@ -111,6 +118,10 @@ async function apply(action: Action, io: SyncIO, baseline: Record<string, Baseli
 		case "download": {
 			if (io.streamGet) {
 				baseline[action.path] = await io.streamGet(action.path, { etag: action.etag ?? "", size: action.size ?? 0 });
+				return;
+			}
+			if (io.pull && (action.size ?? 0) > CHUNK_BYTES) {
+				baseline[action.path] = await io.pull(action.path, { etag: action.etag ?? "", size: action.size ?? 0 });
 				return;
 			}
 			const got = await io.get(action.path);

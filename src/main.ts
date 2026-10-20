@@ -5,8 +5,9 @@ interface ExplorerItem {
 	collapsed?: boolean;
 	setCollapsed?(collapsed: boolean): void;
 }
+import { keptBytes, partialMetaPath, partialPath, pullChunks } from "./chunks";
 import { parentFolders } from "./folders";
-import { deleteCount, MAX_TRANSFER_ATTEMPTS, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
+import { deleteCount, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
 import { desktopModules, forgetPartialMeta, partialFile, preparePartial, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
 import { execute, type SyncIO, type SyncProgress } from "./sync";
@@ -122,7 +123,14 @@ export default class SyncUpNotesPlugin extends Plugin {
 			new Notice("SyncUp Notes: this vault and the server folder don't match, so nothing was changed.");
 			return false;
 		}
-		const actions = planSync({ local, remote, baseline: this.settings.baseline, fileLimit: listing.fileLimit, attempts: this.settings.retries });
+		const actions = planSync({
+			local,
+			remote,
+			baseline: this.settings.baseline,
+			fileLimit: listing.fileLimit,
+			attempts: this.settings.retries,
+			overLimit: this.settings.overLimit,
+		});
 		const deletes = deleteCount(actions);
 		if (deletes > 25) {
 			this.setStatus(`SyncUp · held ${deletes} deletes`);
@@ -130,9 +138,16 @@ export default class SyncUpNotesPlugin extends Plugin {
 			return true;
 		}
 		const before = JSON.stringify(this.settings.baseline);
-		const result = await execute(actions, this.vaultIO(dav), this.settings.baseline, (update) => this.showProgress(update));
+		const beforeLimit = JSON.stringify(this.settings.overLimit ?? null);
+		const result = await execute(actions, this.vaultIO(dav), this.settings.baseline, (update) => this.showProgress(update), async (baseline) => {
+			this.settings.baseline = baseline;
+			await this.saveData(this.settings);
+		});
 		this.settings.baseline = result.baseline;
-		if (JSON.stringify(result.baseline) !== before) await this.saveData(this.settings);
+		const parked = actions.filter((action) => action.type === "parked").map((action) => action.path);
+		const remembered = nextOverLimit(result.fileLimit ?? listing.fileLimit, parked, result.skipped, this.settings.overLimit);
+		if (remembered) this.settings.overLimit = remembered;
+		if (JSON.stringify(result.baseline) !== before || JSON.stringify(this.settings.overLimit ?? null) !== beforeLimit) await this.saveData(this.settings);
 		if (result.abort === "auth") {
 			this.setStatus("SyncUp · failed");
 			new Notice("SyncUp Notes: check the email and application password");
@@ -159,10 +174,6 @@ export default class SyncUpNotesPlugin extends Plugin {
 			new Notice(`SyncUp Notes: ${result.errors[0]}`);
 			return true;
 		}
-		if (result.skipped.length > 0) {
-			this.setStatus(`SyncUp · ${result.skipped.length} over the file limit`);
-			return true;
-		}
 		this.setStatus("SyncUp · up to date");
 		return true;
 	}
@@ -184,6 +195,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 			stat: async (path) => this.statFile(path),
 			streamPut: root ? (path, match) => this.streamPut(dav, root, path, match) : undefined,
 			streamGet: root ? (path, file) => this.streamGet(dav, root, path, file) : undefined,
+			pull: root ? undefined : (path, file) => this.pullFile(dav, path, file),
 		};
 	}
 
@@ -225,6 +237,58 @@ export default class SyncUpNotesPlugin extends Plugin {
 			throw new Error(`missing ${vaultPath}`);
 		} finally {
 			this.applying = false;
+		}
+	}
+
+	private async pullFile(dav: WebDav, vaultPath: string, file: { etag: string; size: number }): Promise<{ size: number; mtime: number; etag: string }> {
+		const adapter = this.app.vault.adapter;
+		if (typeof adapter.appendBinary !== "function") throw new Error("update Obsidian to resume a large download");
+		const partial = partialPath(vaultPath);
+		const metaPath = partialMetaPath(vaultPath);
+		await this.adapterParents(partial);
+		const meta = await readPartialMeta(adapter, metaPath);
+		const have = (await adapter.stat(partial))?.size ?? 0;
+		const offset = keptBytes(meta, have, file.etag, file.size);
+		if (offset === 0 && have > 0) await adapter.remove(partial);
+		await adapter.write(metaPath, JSON.stringify({ etag: file.etag, size: file.size, offset }));
+		await pullChunks({
+			size: file.size,
+			offset,
+			fetchRange: (start, end) => dav.getRange(vaultPath, start, end),
+			writeAt: async (at, body) => {
+				const bytes = copyBuffer(body);
+				if (at === 0) await adapter.writeBinary(partial, bytes);
+				else await adapter.appendBinary(partial, bytes);
+				await adapter.write(metaPath, JSON.stringify({ etag: file.etag, size: file.size, offset: at + body.byteLength }));
+			},
+		});
+		this.applying = true;
+		try {
+			await this.ensureParents(vaultPath);
+			if (await adapter.exists(vaultPath)) await adapter.remove(vaultPath);
+			await adapter.rename(partial, vaultPath);
+				if (await adapter.exists(metaPath)) await adapter.remove(metaPath);
+		} finally {
+			this.applying = false;
+		}
+		for (let attempt = 0; attempt < 50; attempt++) {
+			const found = this.app.vault.getAbstractFileByPath(vaultPath);
+			if (found instanceof TFile) return { size: found.stat.size, mtime: found.stat.mtime, etag: file.etag };
+			await new Promise((resolve) => window.setTimeout(resolve, 100));
+		}
+		throw new Error(`missing ${vaultPath}`);
+	}
+
+	private async adapterParents(path: string): Promise<void> {
+		const adapter = this.app.vault.adapter;
+		for (const folder of parentFolders(path)) {
+			if (await adapter.exists(folder)) continue;
+			try {
+				await adapter.mkdir(folder);
+			} catch (error) {
+				if (await adapter.exists(folder)) continue;
+				throw error;
+			}
 		}
 	}
 
@@ -447,6 +511,16 @@ export default class SyncUpNotesPlugin extends Plugin {
 
 	private setStatus(text: string) {
 		if (this.statusEl) this.statusEl.setText(text);
+	}
+}
+
+async function readPartialMeta(adapter: { exists(path: string): Promise<boolean>; read(path: string): Promise<string> }, path: string): Promise<{ etag?: string; size?: number } | null> {
+	try {
+		if (!(await adapter.exists(path))) return null;
+		const parsed = JSON.parse(await adapter.read(path)) as { etag?: string; size?: number };
+		return parsed && typeof parsed === "object" ? parsed : null;
+	} catch {
+		return null;
 	}
 }
 

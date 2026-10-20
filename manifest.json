@@ -1,8 +1,8 @@
 {
 	"id": "syncup-notes",
 	"name": "SyncUp Notes",
-	"version": "0.2.7",
-	"minAppVersion": "1.5.0",
+	"version": "0.2.9",
+	"minAppVersion": "1.12.3",
 	"description": "Sync a vault with SyncUp Notes.",
 	"author": "SyncUp",
 	"isDesktopOnly": false

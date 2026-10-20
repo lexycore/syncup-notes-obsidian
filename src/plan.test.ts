@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deleteCount, MAX_TRANSFER_ATTEMPTS, overLimitNotice, pathsDiffer, planSync, transferKey, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
+import { deleteCount, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, transferKey, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
 
 const local = (path: string, size: number, mtime: number): LocalFile => ({ path, size, mtime });
 const remote = (path: string, size: number, mtime: number, etag: string): RemoteFile => ({ path, size, mtime, etag });
@@ -25,7 +25,7 @@ test("first sync copies missing files and does not delete", () => {
 		remote: [remote("b.md", 4, 2_000, "bbb")],
 		baseline: {},
 	});
-	assert.deepEqual(types(actions), ["download b.md", "upload a.md"]);
+	assert.deepEqual(types(actions), ["upload a.md", "download b.md"]);
 });
 
 test("first sync treats equal sizes as already stored", () => {
@@ -35,6 +35,15 @@ test("first sync treats equal sizes as already stored", () => {
 		baseline: {},
 	});
 	assert.deepEqual(actions, [{ type: "unchanged", path: "a.md", etag: "aaa", size: 3, mtime: 5_000 }]);
+});
+
+test("a local note is sent before a large download", () => {
+	const actions = planSync({
+		local: [local("note.md", 20, 1)],
+		remote: [remote("a-clip.mp4", 200_000_000, 1, "v"), remote("z-note.md", 10, 1, "o")],
+		baseline: {},
+	});
+	assert.deepEqual(types(actions), ["upload note.md", "download z-note.md", "download a-clip.mp4"]);
 });
 
 test("uploads when only the local file changed", () => {
@@ -184,6 +193,41 @@ test("uploads a video that fits the plan and skips one that does not", () => {
 		fileLimit: 512 * 1024 * 1024,
 	});
 	assert.deepEqual(types(over), ["upload ok.md", "skip-large talk.mp4"]);
+	const quiet = planSync({
+		local: [local("talk.mp4", video, 1_000), local("ok.md", 2, 1_000)],
+		remote: [],
+		baseline: {},
+		fileLimit: 512 * 1024 * 1024,
+		overLimit: { limit: 512 * 1024 * 1024, paths: ["talk.mp4"] },
+	});
+	assert.deepEqual(types(quiet), ["upload ok.md", "parked talk.mp4"]);
+	const raised = planSync({
+		local: [local("talk.mp4", video, 1_000)],
+		remote: [],
+		baseline: {},
+		fileLimit: 2 * 1024 * 1024 * 1024,
+		overLimit: { limit: 512 * 1024 * 1024, paths: ["talk.mp4"] },
+	});
+	assert.deepEqual(types(raised), ["upload talk.mp4"]);
+	const stillOver = planSync({
+		local: [local("talk.mp4", video, 1_000)],
+		remote: [],
+		baseline: {},
+		fileLimit: 600 * 1024 * 1024,
+		overLimit: { limit: 512 * 1024 * 1024, paths: ["talk.mp4"] },
+	});
+	assert.deepEqual(types(stillOver), ["skip-large talk.mp4"]);
+	const smaller = planSync({
+		local: [local("talk.mp4", 100, 2_000)],
+		remote: [],
+		baseline: {},
+		fileLimit: 512 * 1024 * 1024,
+		overLimit: { limit: 512 * 1024 * 1024, paths: ["talk.mp4"] },
+	});
+	assert.deepEqual(types(smaller), ["upload talk.mp4"]);
+	const limit = 512 * 1024 * 1024;
+	assert.deepEqual(nextOverLimit(limit, ["a.mp4"], ["b.mp4"], { limit, paths: ["a.mp4"] }), { limit, paths: ["a.mp4", "b.mp4"] });
+	assert.deepEqual(nextOverLimit(undefined, [], [], { limit, paths: ["a.mp4"] }), { limit, paths: ["a.mp4"] });
 	assert.equal(overLimitNotice(["Выступления/talk.mp4"], 512 * 1024 * 1024), "talk.mp4 is larger than the 512 MB limit on your plan");
 	assert.equal(overLimitNotice(["a.mp4", "b.mp4"], 2 * 1024 * 1024 * 1024), "2 files are larger than the 2 GB limit on your plan");
 });

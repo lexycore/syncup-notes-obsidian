@@ -4,6 +4,26 @@ import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
 import { execute, type SyncIO } from "./sync.ts";
 import { ConflictError, QuotaError, TooLargeError } from "./webdav.ts";
 
+test("each finished file is saved before the next one starts", async () => {
+	const seen: string[] = [];
+	const io = fake({
+		read: async () => new Uint8Array([1]),
+		put: async () => ({ etag: "e" }),
+		stat: async () => ({ size: 1, mtime: 2 }),
+	});
+	await execute(
+		[{ type: "upload", path: "a.md", size: 1 }, { type: "upload", path: "b.md", size: 1 }],
+		io,
+		{},
+		undefined,
+		(baseline) => {
+			seen.push(Object.keys(baseline).sort().join(","));
+			return Promise.resolve();
+		},
+	);
+	assert.deepEqual(seen, ["a.md", "a.md,b.md"]);
+});
+
 test("an upload records the server etag and the local mtime", async () => {
 	const baseline: Record<string, BaselineEntry> = {};
 	const io = fake({
