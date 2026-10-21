@@ -4,6 +4,32 @@ import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
 import { execute, type SyncIO } from "./sync.ts";
 import { ConflictError, QuotaError, TooLargeError } from "./webdav.ts";
 
+test("a change during a sync stops the run so the new plan can start", async () => {
+	const seen: string[] = [];
+	let queued = false;
+	const io = fake({
+		read: async () => new Uint8Array([1]),
+		put: async (path) => {
+			seen.push(path);
+			queued = true;
+			return { etag: "e" };
+		},
+		stat: async () => ({ size: 1, mtime: 2 }),
+	});
+	const result = await execute(
+		[{ type: "upload", path: "a.md", size: 1 }, { type: "upload", path: "b.md", size: 1 }],
+		io,
+		{},
+		undefined,
+		undefined,
+		() => queued,
+	);
+	assert.deepEqual(seen, ["a.md"]);
+	assert.equal(result.yielded, true);
+	assert.equal(result.baseline["a.md"].etag, "e");
+	assert.equal(result.baseline["b.md"], undefined);
+});
+
 test("each finished file is saved before the next one starts", async () => {
 	const seen: string[] = [];
 	const io = fake({

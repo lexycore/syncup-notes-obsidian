@@ -19,9 +19,11 @@ export async function pullChunks(input: {
 	offset: number;
 	fetchRange: (start: number, end: number) => Promise<Uint8Array>;
 	writeAt: (offset: number, body: Uint8Array) => Promise<void>;
-}): Promise<void> {
+	stop?: () => boolean;
+}): Promise<boolean> {
 	let offset = input.offset;
 	while (offset < input.size) {
+		if (input.stop?.()) return false;
 		const end = Math.min(input.size - 1, offset + CHUNK_BYTES - 1);
 		const body = await input.fetchRange(offset, end);
 		const expected = end - offset + 1;
@@ -29,4 +31,5 @@ export async function pullChunks(input: {
 		await input.writeAt(offset, body);
 		offset += expected;
 	}
+	return true;
 }

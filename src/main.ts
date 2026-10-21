@@ -7,10 +7,10 @@ interface ExplorerItem {
 }
 import { keptBytes, partialMetaPath, partialPath, pullChunks } from "./chunks";
 import { parentFolders } from "./folders";
-import { deleteCount, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
+import { deleteCount, ignored, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
 import { desktopModules, forgetPartialMeta, partialFile, preparePartial, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
-import { execute, type SyncIO, type SyncProgress } from "./sync";
+import { execute, SyncYield, type SyncIO, type SyncProgress } from "./sync";
 import { encodeView, openFolders, parseView, snapshot, syncFolders, VIEW_PATH, type FolderToggle, type ViewState } from "./viewstate";
 import { AuthError, QuotaError, TooLargeError, WebDav, type HttpRequest, type HttpResponse } from "./webdav";
 
@@ -39,10 +39,10 @@ export default class SyncUpNotesPlugin extends Plugin {
 		this.setStatus("SyncUp");
 		this.addSettingTab(new SyncUpSettingTab(this.app, this));
 		this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.sync() });
-		this.registerEvent(this.app.vault.on("create", () => this.onVaultChange()));
-		this.registerEvent(this.app.vault.on("modify", () => this.onVaultChange()));
-		this.registerEvent(this.app.vault.on("delete", () => this.onVaultChange()));
-		this.registerEvent(this.app.vault.on("rename", () => this.onVaultChange()));
+		this.registerEvent(this.app.vault.on("create", (file) => this.onVaultChange(file.path)));
+		this.registerEvent(this.app.vault.on("modify", (file) => this.onVaultChange(file.path)));
+		this.registerEvent(this.app.vault.on("delete", (file) => this.onVaultChange(file.path)));
+		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onVaultChange(file.path, oldPath)));
 		this.armInterval();
 		this.app.workspace.onLayoutReady(() => {
 			this.registerInterval(window.setInterval(() => void this.publishExplorer(), 1000));
@@ -142,7 +142,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 		const result = await execute(actions, this.vaultIO(dav), this.settings.baseline, (update) => this.showProgress(update), async (baseline) => {
 			this.settings.baseline = baseline;
 			await this.saveData(this.settings);
-		});
+		}, () => this.queued);
 		this.settings.baseline = result.baseline;
 		const parked = actions.filter((action) => action.type === "parked").map((action) => action.path);
 		const remembered = nextOverLimit(result.fileLimit ?? listing.fileLimit, parked, result.skipped, this.settings.overLimit);
@@ -172,6 +172,10 @@ export default class SyncUpNotesPlugin extends Plugin {
 		if (result.errors.length > 0 && !paused) {
 			this.setStatus("SyncUp · failed");
 			new Notice(`SyncUp Notes: ${result.errors[0]}`);
+			return true;
+		}
+		if (result.yielded) {
+			this.setStatus("SyncUp");
 			return true;
 		}
 		this.setStatus("SyncUp · up to date");
@@ -251,10 +255,11 @@ export default class SyncUpNotesPlugin extends Plugin {
 		const offset = keptBytes(meta, have, file.etag, file.size);
 		if (offset === 0 && have > 0) await adapter.remove(partial);
 		await adapter.write(metaPath, JSON.stringify({ etag: file.etag, size: file.size, offset }));
-		await pullChunks({
+		const done = await pullChunks({
 			size: file.size,
 			offset,
 			fetchRange: (start, end) => dav.getRange(vaultPath, start, end),
+			stop: () => this.queued,
 			writeAt: async (at, body) => {
 				const bytes = copyBuffer(body);
 				if (at === 0) await adapter.writeBinary(partial, bytes);
@@ -262,12 +267,13 @@ export default class SyncUpNotesPlugin extends Plugin {
 				await adapter.write(metaPath, JSON.stringify({ etag: file.etag, size: file.size, offset: at + body.byteLength }));
 			},
 		});
+		if (!done) throw new SyncYield();
 		this.applying = true;
 		try {
 			await this.ensureParents(vaultPath);
 			if (await adapter.exists(vaultPath)) await adapter.remove(vaultPath);
 			await adapter.rename(partial, vaultPath);
-				if (await adapter.exists(metaPath)) await adapter.remove(metaPath);
+			if (await adapter.exists(metaPath)) await adapter.remove(metaPath);
 		} finally {
 			this.applying = false;
 		}
@@ -465,8 +471,9 @@ export default class SyncUpNotesPlugin extends Plugin {
 		}
 	}
 
-	private onVaultChange() {
+	private onVaultChange(path?: string, oldPath?: string) {
 		if (this.applying || !this.settings.syncOnSave) return;
+		if ((path && ignored(path)) || (oldPath && ignored(oldPath))) return;
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
 		this.saveTimer = window.setTimeout(() => {
 			this.saveTimer = null;

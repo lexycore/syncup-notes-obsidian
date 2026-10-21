@@ -24,12 +24,20 @@ export interface SyncProgress {
 
 const SAVED = new Set<Action["type"]>(["upload", "download", "conflict", "delete-local", "delete-remote", "move", "forget"]);
 
+export class SyncYield extends Error {
+	constructor() {
+		super("yield");
+		this.name = "SyncYield";
+	}
+}
+
 export async function execute(
 	actions: Action[],
 	io: SyncIO,
 	baseline: Record<string, BaselineEntry>,
 	progress?: (update: SyncProgress) => void,
 	checkpoint?: (baseline: Record<string, BaselineEntry>) => Promise<void>,
+	pause?: () => boolean,
 ): Promise<{
 	baseline: Record<string, BaselineEntry>;
 	skipped: string[];
@@ -39,6 +47,7 @@ export async function execute(
 	fileLimit?: number;
 	conflicts: string[];
 	abort?: "auth" | "quota";
+	yielded?: boolean;
 }> {
 	const next = { ...baseline };
 	const skipped: string[] = [];
@@ -60,6 +69,7 @@ export async function execute(
 			continue;
 		}
 		if (action.type === "paused" || action.type === "parked") continue;
+		if (pause?.()) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, yielded: true };
 		done += 1;
 		progress?.({ done, total: work.length, action });
 		await yieldToUI();
@@ -69,6 +79,7 @@ export async function execute(
 			if (action.type === "skip-large") skipped.push(action.path);
 			if (SAVED.has(action.type) && checkpoint) await checkpoint(next);
 		} catch (error) {
+			if (error instanceof SyncYield) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, yielded: true };
 			if (error instanceof AuthError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, abort: "auth" };
 			if (error instanceof QuotaError) return { baseline: next, skipped, errors, failed, transferred, fileLimit, conflicts, abort: "quota" };
 			if (error instanceof TooLargeError && error.limit > 0) {
