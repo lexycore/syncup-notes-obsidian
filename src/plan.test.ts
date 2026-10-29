@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deleteCount, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, transferKey, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
+import { deleteCount, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, rememberRename, retainRenames, transferKey, type BaselineEntry, type LocalFile, type RemoteFile } from "./plan.ts";
 
 const local = (path: string, size: number, mtime: number): LocalFile => ({ path, size, mtime });
 const remote = (path: string, size: number, mtime: number, etag: string): RemoteFile => ({ path, size, mtime, etag });
@@ -102,6 +102,112 @@ test("renaming a file moves it instead of deleting the old name", () => {
 	assert.equal(actions[0].from, "TG/tg-alkovpro/2026/2026-10/2026-10-20-SyncUp-Notes.md");
 	assert.equal(actions[0].path, "TG/tg-alkovpro/2026/2026-10/+2026-10-20-SyncUp-Notes.md");
 	assert.equal(deleteCount(actions), 0);
+});
+
+test("a recorded rename moves the note when the old file is left behind and the body changed", () => {
+	const from = "TG/tg-alkovpro/2026/2026-10/2026-10-21-SyncUp-Notes.md";
+	const to = "TG/tg-alkovpro/2026/2026-10/2026-10-28-Игра.md";
+	const actions = planSync({
+		local: [local(from, 3, 5_000), local(to, 1438, 9_000)],
+		remote: [remote(from, 3, 5_000, "stub")],
+		baseline: { [from]: base(3, 5_000, "stub") },
+		renames: [{ from, to }],
+	});
+	const move = actions.find((action) => action.type === "move");
+	assert.ok(move && move.type === "move");
+	assert.equal(move.from, from);
+	assert.equal(move.path, to);
+	assert.equal(move.files[0].changed, true);
+	assert.equal(move.files[0].etag, "stub");
+	assert.deepEqual(types(actions), [`move ${to}`, `upload ${to}`, `delete-local ${from}`]);
+});
+
+test("a recorded rename moves a deleted old path even when the note body changed", () => {
+	const actions = planSync({
+		local: [local("2026-10-28-Игра.md", 1438, 9_000)],
+		remote: [remote("2026-10-21-SyncUp-Notes.md", 3, 5_000, "stub")],
+		baseline: { "2026-10-21-SyncUp-Notes.md": base(3, 5_000, "stub") },
+		renames: [{ from: "2026-10-21-SyncUp-Notes.md", to: "2026-10-28-Игра.md" }],
+	});
+	const move = actions.find((action) => action.type === "move");
+	assert.ok(move && move.type === "move");
+	assert.equal(move.files[0].changed, true);
+	assert.deepEqual(types(actions), ["move 2026-10-28-Игра.md", "upload 2026-10-28-Игра.md"]);
+});
+
+test("a new note beside an unchanged stub stays a new note", () => {
+	const from = "2026-10-21-SyncUp-Notes.md";
+	const to = "2026-10-28-Игра.md";
+	const actions = planSync({
+		local: [local(from, 3, 5_000), local(to, 1438, 9_000)],
+		remote: [remote(from, 3, 5_000, "stub")],
+		baseline: { [from]: base(3, 5_000, "stub") },
+	});
+	assert.deepEqual(types(actions), [`upload ${to}`, `unchanged ${from}`]);
+});
+
+test("a recorded rename leaves the old note when it was edited after the rename", () => {
+	const from = "2026-10-21-SyncUp-Notes.md";
+	const to = "2026-10-28-Игра.md";
+	const actions = planSync({
+		local: [local(from, 9, 8_000), local(to, 1438, 9_000)],
+		remote: [remote(from, 3, 5_000, "stub")],
+		baseline: { [from]: base(3, 5_000, "stub") },
+		renames: [{ from, to }],
+	});
+	assert.deepEqual(types(actions), [`upload ${from}`, `upload ${to}`]);
+});
+
+test("a recorded rename leaves the old note when another device changed it", () => {
+	const from = "2026-10-21-SyncUp-Notes.md";
+	const to = "2026-10-28-Игра.md";
+	const actions = planSync({
+		local: [local(from, 3, 5_000), local(to, 1438, 9_000)],
+		remote: [remote(from, 20, 8_000, "edited")],
+		baseline: { [from]: base(3, 5_000, "stub") },
+		renames: [{ from, to }],
+	});
+	assert.deepEqual(types(actions), [`upload ${to}`, `download ${from}`]);
+});
+
+test("two renames of the same note before sync move the original path", () => {
+	const actions = planSync({
+		local: [local("c.md", 20, 9_000)],
+		remote: [remote("a.md", 3, 5_000, "stub")],
+		baseline: { "a.md": base(3, 5_000, "stub") },
+		renames: [{ from: "a.md", to: "b.md" }, { from: "b.md", to: "c.md" }],
+	});
+	const move = actions.find((action) => action.type === "move");
+	assert.ok(move && move.type === "move");
+	assert.equal(move.from, "a.md");
+	assert.equal(move.path, "c.md");
+	assert.deepEqual(types(actions), ["move c.md", "upload c.md"]);
+});
+
+test("rememberRename folds a chain and a second name for the same note", () => {
+	assert.deepEqual(rememberRename([{ from: "a.md", to: "b.md" }], "b.md", "c.md"), [{ from: "a.md", to: "c.md" }]);
+	assert.deepEqual(rememberRename([{ from: "a.md", to: "b.md" }], "a.md", "c.md"), [{ from: "a.md", to: "c.md" }]);
+	assert.deepEqual(rememberRename([{ from: "a.md", to: "b.md" }], "b.md", "a.md"), []);
+});
+
+test("retainRenames drops a hint after the move and drops one that can no longer apply", () => {
+	const from = "a.md";
+	const to = "b.md";
+	const renames = [{ from, to }];
+	const localFiles = [local(from, 3, 5_000), local(to, 9, 8_000)];
+	const remoteFiles = [remote(from, 3, 5_000, "stub")];
+	const baseline = { [from]: base(3, 5_000, "stub") };
+	const actions = planSync({ local: localFiles, remote: remoteFiles, baseline, renames });
+	assert.deepEqual(retainRenames({ renames, actions, succeeded: true, local: localFiles, remote: remoteFiles, baseline }), []);
+	assert.deepEqual(retainRenames({ renames, actions, succeeded: false, local: localFiles, remote: remoteFiles, baseline }), renames);
+	assert.deepEqual(retainRenames({
+		renames,
+		actions,
+		succeeded: false,
+		local: [local(from, 9, 8_000)],
+		remote: remoteFiles,
+		baseline,
+	}), []);
 });
 
 test("renaming a folder moves the whole tree", () => {

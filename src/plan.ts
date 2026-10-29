@@ -41,6 +41,11 @@ export interface MovedFile {
 	changed: boolean;
 }
 
+export interface RecordedRename {
+	from: string;
+	to: string;
+}
+
 export type Action =
 	| { type: "upload"; path: string; size?: number; mtime?: number; match?: string }
 	| { type: "download"; path: string; size?: number; etag?: string }
@@ -100,6 +105,7 @@ export function planSync(input: {
 	fileLimit?: number;
 	attempts?: Record<string, TransferAttempt>;
 	overLimit?: OverLimit;
+	renames?: RecordedRename[];
 }): Action[] {
 	const locals = new Map(input.local.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
 	const remotes = new Map(input.remote.filter((file) => !ignored(file.path)).map((file) => [file.path, file]));
@@ -110,7 +116,7 @@ export function planSync(input: {
 		const action = decide(path, locals.get(path), remotes.get(path), input.baseline[path], input.fileLimit, parked);
 		if (action) actions.push(pauseTransfer(action, input.attempts));
 	}
-	const renamed = rewriteRenames(actions, locals, remotes, input.baseline);
+	const renamed = rewriteRenames(actions, locals, remotes, input.baseline, foldRenames(input.renames ?? []));
 	renamed.sort((a, b) => ORDER[a.type] - ORDER[b.type] || actionSize(a) - actionSize(b) || a.path.localeCompare(b.path));
 	return renamed;
 }
@@ -207,13 +213,15 @@ function rewriteRenames(
 	local: Map<string, LocalFile>,
 	remote: Map<string, RemoteFile>,
 	baseline: Record<string, BaselineEntry>,
+	renames: RecordedRename[],
 ): Action[] {
+	const hinted = hintedMoves(renames, local, remote, baseline);
 	const removed = actions.filter((action) => action.type === "delete-remote" && remote.has(action.path) && baseline[action.path]).map((action) => action.path);
 	const added = actions.filter((action) => action.type === "upload" && !remote.has(action.path) && !baseline[action.path]).map((action) => action.path);
-	if (removed.length === 0 || added.length === 0) return actions;
+	if (removed.length === 0 || added.length === 0) return finishRenames(actions, hinted);
 	const moves = directoryMoves(removed, added, local, remote, baseline);
-	const usedFrom = new Set<string>();
-	const usedTo = new Set<string>();
+	const usedFrom = new Set<string>(hinted.moves.flatMap((move) => move.files.map((file) => file.from)));
+	const usedTo = new Set<string>(hinted.moves.flatMap((move) => move.files.map((file) => file.path)));
 	for (const move of moves) {
 		for (const file of move.files) {
 			usedFrom.add(file.from);
@@ -224,13 +232,104 @@ function rewriteRenames(
 	for (const move of moves) {
 		for (const file of move.files) usedTo.add(file.path);
 	}
-	if (moves.length === 0) return actions;
+	if (moves.length === 0 && hinted.moves.length === 0) return actions;
+	return finishRenames(actions, { moves: hinted.moves.concat(moves), leftovers: hinted.leftovers }, usedFrom, usedTo);
+}
+
+function finishRenames(
+	actions: Action[],
+	hinted: { moves: Extract<Action, { type: "move" }>[]; leftovers: Set<string> },
+	usedFrom = new Set<string>(hinted.moves.flatMap((move) => move.files.map((file) => file.from))),
+	usedTo = new Set<string>(hinted.moves.flatMap((move) => move.files.map((file) => file.path))),
+): Action[] {
+	if (hinted.moves.length === 0) return actions;
 	const kept = actions.filter((action) => {
+		if (action.type === "unchanged" && hinted.leftovers.has(action.path)) return false;
 		if (action.type === "delete-remote" && usedFrom.has(action.path)) return false;
 		if (action.type !== "upload" || !usedTo.has(action.path)) return true;
-		return moves.some((move) => move.files.some((file) => file.path === action.path && file.changed));
+		return hinted.moves.some((move) => move.files.some((file) => file.path === action.path && file.changed));
 	});
-	return kept.concat(moves);
+	const deletes = [...hinted.leftovers].map((path): Action => ({ type: "delete-local", path }));
+	return kept.concat(hinted.moves, deletes);
+}
+
+export function rememberRename(renames: RecordedRename[], from: string, to: string): RecordedRename[] {
+	if (!from || !to || from === to) return foldRenames(renames);
+	return foldRenames([...renames, { from, to }]);
+}
+
+export function retainRenames(input: {
+	renames: RecordedRename[];
+	actions: Action[];
+	succeeded: boolean;
+	local: LocalFile[];
+	remote: RemoteFile[];
+	baseline: Record<string, BaselineEntry>;
+}): RecordedRename[] {
+	const local = new Map(input.local.map((file) => [file.path, file]));
+	const remote = new Map(input.remote.map((file) => [file.path, file]));
+	return foldRenames(input.renames).filter((hint) => {
+		if (!hintedMove(hint, local, remote, input.baseline)) return false;
+		const planned = input.actions.some((action) => action.type === "move" && action.files.some((file) => file.from === hint.from && file.path === hint.to));
+		return !(planned && input.succeeded);
+	});
+}
+
+function foldRenames(renames: RecordedRename[]): RecordedRename[] {
+	const latest = new Map<string, string>();
+	for (const hint of renames) {
+		if (!hint.from || !hint.to || hint.from === hint.to) continue;
+		let origin = hint.from;
+		for (const [start, dest] of latest) {
+			if (dest !== hint.from) continue;
+			origin = start;
+			latest.delete(start);
+			break;
+		}
+		latest.set(origin, hint.to);
+	}
+	return [...latest].filter(([from, to]) => from !== to).map(([from, to]) => ({ from, to }));
+}
+
+function hintedMoves(
+	renames: RecordedRename[],
+	local: Map<string, LocalFile>,
+	remote: Map<string, RemoteFile>,
+	baseline: Record<string, BaselineEntry>,
+): { moves: Extract<Action, { type: "move" }>[]; leftovers: Set<string> } {
+	const moves: Extract<Action, { type: "move" }>[] = [];
+	const leftovers = new Set<string>();
+	for (const hint of renames) {
+		const move = hintedMove(hint, local, remote, baseline);
+		if (!move) continue;
+		moves.push(move.action);
+		if (move.leftover) leftovers.add(hint.from);
+	}
+	return { moves, leftovers };
+}
+
+function hintedMove(
+	hint: RecordedRename,
+	local: Map<string, LocalFile>,
+	remote: Map<string, RemoteFile>,
+	baseline: Record<string, BaselineEntry>,
+): { action: Extract<Action, { type: "move" }>; leftover: boolean } | null {
+	const prior = baseline[hint.from];
+	const onServer = remote.get(hint.from);
+	const destination = local.get(hint.to);
+	const source = local.get(hint.from);
+	if (!prior || !onServer || !destination || hint.from === hint.to) return null;
+	if (onServer.etag !== prior.etag || remote.has(hint.to) || baseline[hint.to]) return null;
+	if (source && (source.size !== prior.size || source.mtime !== prior.mtime)) return null;
+	const file: MovedFile = {
+		from: hint.from,
+		path: hint.to,
+		etag: prior.etag,
+		size: destination.size,
+		mtime: destination.mtime,
+		changed: destination.size !== onServer.size,
+	};
+	return { leftover: source !== undefined, action: { type: "move", from: hint.from, path: hint.to, files: [file] } };
 }
 
 function directoryMoves(

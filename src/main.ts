@@ -7,7 +7,7 @@ interface ExplorerItem {
 }
 import { keptBytes, partialMetaPath, partialPath, pullChunks } from "./chunks";
 import { parentFolders } from "./folders";
-import { deleteCount, ignored, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
+import { deleteCount, ignored, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, rememberRename, retainRenames, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
 import { desktopModules, forgetPartialMeta, partialFile, preparePartial, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
 import { execute, SyncYield, type SyncIO, type SyncProgress } from "./sync";
@@ -17,7 +17,7 @@ import { AuthError, QuotaError, TooLargeError, WebDav, type HttpRequest, type Ht
 const SAVE_DELAY_MS = 2000;
 
 export default class SyncUpNotesPlugin extends Plugin {
-	settings: SyncUpSettings = { ...DEFAULT_SETTINGS, baseline: {}, retries: {} };
+	settings: SyncUpSettings = { ...DEFAULT_SETTINGS, baseline: {}, retries: {}, renames: [] };
 	private serverResume = false;
 	private statusEl: HTMLElement | null = null;
 	private saveTimer: number | null = null;
@@ -42,7 +42,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 		this.registerEvent(this.app.vault.on("create", (file) => this.onVaultChange(file.path)));
 		this.registerEvent(this.app.vault.on("modify", (file) => this.onVaultChange(file.path)));
 		this.registerEvent(this.app.vault.on("delete", (file) => this.onVaultChange(file.path)));
-		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onVaultChange(file.path, oldPath)));
+		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.noteRename(file.path, oldPath)));
 		this.armInterval();
 		this.app.workspace.onLayoutReady(() => {
 			this.registerInterval(window.setInterval(() => void this.publishExplorer(), 1000));
@@ -57,7 +57,7 @@ export default class SyncUpNotesPlugin extends Plugin {
 
 	async loadSettings() {
 		const stored = await this.loadData();
-		this.settings = { ...DEFAULT_SETTINGS, ...(stored ?? {}), baseline: stored?.baseline ?? {}, retries: stored?.retries ?? {} };
+		this.settings = { ...DEFAULT_SETTINGS, ...(stored ?? {}), baseline: stored?.baseline ?? {}, retries: stored?.retries ?? {}, renames: stored?.renames ?? [] };
 	}
 
 	async saveSettings() {
@@ -123,13 +123,16 @@ export default class SyncUpNotesPlugin extends Plugin {
 			new Notice("SyncUp Notes: this vault and the server folder don't match, so nothing was changed.");
 			return false;
 		}
+		const renames = this.settings.renames ?? [];
+		const baseline = this.settings.baseline;
 		const actions = planSync({
 			local,
 			remote,
-			baseline: this.settings.baseline,
+			baseline,
 			fileLimit: listing.fileLimit,
 			attempts: this.settings.retries,
 			overLimit: this.settings.overLimit,
+			renames,
 		});
 		const deletes = deleteCount(actions);
 		if (deletes > 25) {
@@ -144,10 +147,16 @@ export default class SyncUpNotesPlugin extends Plugin {
 			await this.saveData(this.settings);
 		}, () => this.queued);
 		this.settings.baseline = result.baseline;
+		const succeeded = !result.yielded && !result.abort && result.errors.length === 0;
+		const current = this.settings.renames ?? [];
+		const changedDuring = JSON.stringify(current) !== JSON.stringify(renames);
+		const kept = changedDuring ? current : retainRenames({ renames, actions, succeeded, local, remote, baseline });
+		const renamesChanged = JSON.stringify(kept) !== JSON.stringify(renames);
+		this.settings.renames = kept;
 		const parked = actions.filter((action) => action.type === "parked").map((action) => action.path);
 		const remembered = nextOverLimit(result.fileLimit ?? listing.fileLimit, parked, result.skipped, this.settings.overLimit);
 		if (remembered) this.settings.overLimit = remembered;
-		if (JSON.stringify(result.baseline) !== before || JSON.stringify(this.settings.overLimit ?? null) !== beforeLimit) await this.saveData(this.settings);
+		if (JSON.stringify(result.baseline) !== before || JSON.stringify(this.settings.overLimit ?? null) !== beforeLimit || renamesChanged) await this.saveData(this.settings);
 		if (result.abort === "auth") {
 			this.setStatus("SyncUp · failed");
 			new Notice("SyncUp Notes: check the email and application password");
@@ -469,6 +478,14 @@ export default class SyncUpNotesPlugin extends Plugin {
 		} finally {
 			this.applying = false;
 		}
+	}
+
+	private async noteRename(path: string, oldPath: string) {
+		if (ignored(path) || ignored(oldPath)) return;
+		this.settings.renames = rememberRename(this.settings.renames ?? [], oldPath, path);
+		await this.saveSettings();
+		if (this.running) this.queued = true;
+		this.onVaultChange(path, oldPath);
 	}
 
 	private onVaultChange(path?: string, oldPath?: string) {
