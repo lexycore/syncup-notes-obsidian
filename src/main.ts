@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, TFile, TFolder, requestUrl } from "obsidian";
+import { MarkdownView, Notice, Platform, Plugin, TFile, TFolder, requestUrl } from "obsidian";
 
 interface ExplorerItem {
 	file?: object;
@@ -10,7 +10,7 @@ import { parentFolders } from "./folders";
 import { deleteCount, ignored, MAX_TRANSFER_ATTEMPTS, nextOverLimit, overLimitNotice, pathsDiffer, planSync, rememberRename, retainRenames, type BaselineEntry, type LocalFile, type TransferAttempt } from "./plan";
 import { SyncUpSettingTab, DEFAULT_SETTINGS, type SyncUpSettings } from "./settings";
 import { desktopModules, forgetPartialMeta, partialFile, preparePartial, streamDownload, streamUpload, vaultFile, type NodeModules } from "./stream";
-import { execute, SyncYield, type SyncIO, type SyncProgress } from "./sync";
+import { execute, incomingReplacesEditor, SyncYield, type SyncIO, type SyncProgress } from "./sync";
 import { encodeView, openFolders, parseView, snapshot, syncFolders, VIEW_PATH, type FolderToggle, type ViewState } from "./viewstate";
 import { AuthError, QuotaError, TooLargeError, WebDav, type HttpRequest, type HttpResponse } from "./webdav";
 
@@ -322,10 +322,31 @@ export default class SyncUpNotesPlugin extends Plugin {
 				await this.ensureParents(path);
 				await this.app.vault.createBinary(path, data);
 			}
+			this.showIncoming(path, body);
 		} finally {
 			this.applying = false;
 		}
 		return this.statFile(path);
+	}
+
+	private showIncoming(path: string, body: Uint8Array) {
+		let text: string;
+		try {
+			text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+		} catch {
+			return;
+		}
+		const encode = new TextEncoder();
+		for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+			const view = leaf.view;
+			if (!(view instanceof MarkdownView) || view.file?.path !== path) continue;
+			if (!incomingReplacesEditor(encode.encode(view.getViewData()), body)) continue;
+			try {
+				view.setViewData(text, false);
+			} catch {
+				// The note is already on disk. A view that rejects the update can save on its own.
+			}
+		}
 	}
 
 	private async removeFile(path: string): Promise<void> {

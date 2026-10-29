@@ -167,6 +167,25 @@ async function keepLocalCopy(path: string, localBody: Uint8Array, io: SyncIO, ba
 	} catch (error) {
 		if (!gone(error)) throw error;
 	}
+	if (server) {
+		const choice = draftChoice(localBody, server.body, baseline[path]?.size ?? 0);
+		if (choice === "same") {
+			const stat = await io.stat(path);
+			baseline[path] = { size: stat.size, mtime: stat.mtime, etag: server.etag };
+			return;
+		}
+		if (choice === "local") {
+			const put = await io.put(path, localBody);
+			const stat = await io.stat(path);
+			baseline[path] = { size: stat.size, mtime: stat.mtime, etag: put.etag };
+			return;
+		}
+		if (choice === "server") {
+			const written = await io.write(path, server.body);
+			baseline[path] = { size: written.size, mtime: written.mtime, etag: server.etag };
+			return;
+		}
+	}
 	const copy = await unusedCopy(path, io);
 	const saved = await io.write(copy, localBody);
 	const put = await io.put(copy, localBody);
@@ -202,6 +221,48 @@ function conflictName(path: string, n: number): string {
 	const ext = dot > 0 ? base.slice(dot) : "";
 	const suffix = n === 1 ? " (conflict)" : ` (conflict ${n})`;
 	return `${dir}${stem}${suffix}${ext}`;
+}
+
+export function incomingReplacesEditor(editor: Uint8Array, incoming: Uint8Array): boolean {
+	return !sameBytes(editor, incoming) && embeds(editor, incoming);
+}
+
+function draftChoice(local: Uint8Array, server: Uint8Array, baselineSize: number): "local" | "server" | "same" | "conflict" {
+	if (sameBytes(local, server)) return "same";
+	if (embeds(server, local) && local.length >= server.length && local.length >= baselineSize) return "local";
+	if (embeds(local, server) && server.length >= local.length && local.length >= baselineSize) return "server";
+	return "conflict";
+}
+
+function embeds(draft: Uint8Array, later: Uint8Array): boolean {
+	if (draft.length > later.length) return false;
+	let shared = 0;
+	const end = draft.length;
+	while (shared < end && draft[shared] === later[shared]) shared += 1;
+	if (shared === draft.length) return true;
+	return indexOfBytes(later, draft.subarray(shared), shared) >= 0;
+}
+
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from: number): number {
+	if (needle.length === 0) return from;
+	const last = haystack.length - needle.length;
+	for (let start = from; start <= last; start += 1) {
+		let matched = true;
+		for (let offset = 0; offset < needle.length; offset += 1) {
+			if (haystack[start + offset] !== needle[offset]) {
+				matched = false;
+				break;
+			}
+		}
+		if (matched) return start;
+	}
+	return -1;
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+	if (left.length !== right.length) return false;
+	for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return false;
+	return true;
 }
 
 function gone(error: unknown): boolean {

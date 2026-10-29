@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MAX_UPLOAD_BYTES, type Action, type BaselineEntry } from "./plan.ts";
-import { execute, type SyncIO } from "./sync.ts";
+import { execute, incomingReplacesEditor, type SyncIO } from "./sync.ts";
 import { ConflictError, QuotaError, TooLargeError } from "./webdav.ts";
 
 test("a change during a sync stops the run so the new plan can start", async () => {
@@ -119,6 +119,91 @@ test("a move drops the old baseline entry and keeps the etag on the new path", a
 	assert.equal(result.baseline["_Archive/Ref/a.md"], undefined);
 	assert.deepEqual(result.baseline["_Archive/Reforma/a.md"], { size: 4, mtime: 8, etag: "a" });
 	assert.equal(result.baseline["_Archive/Reforma/b.md"], undefined);
+});
+
+test("a conflict that inserts into the same note stays one file", async () => {
+	const server = new TextEncoder().encode("Видели когда-нибудь System Design ");
+	const local = new TextEncoder().encode("Видели когда-нибудь воркшоп по System Design про ML");
+	const puts: string[] = [];
+	const io = fake({
+		read: async () => local,
+		get: async () => ({ body: server, etag: "server" }),
+		put: async (path) => {
+			puts.push(path);
+			return { etag: "local" };
+		},
+		write: async () => {
+			throw new Error("conflict copy");
+		},
+		stat: async () => ({ size: local.length, mtime: 9 }),
+	});
+	const result = await execute([{ type: "conflict", path: "note.md", etag: "server" }], io, {
+		"note.md": { size: server.length, mtime: 1, etag: "old" },
+	});
+	assert.deepEqual(puts, ["note.md"]);
+	assert.deepEqual(result.conflicts, []);
+	assert.equal(result.baseline["note.md"].etag, "local");
+	assert.deepEqual(result.errors, []);
+});
+
+test("a conflict keeps the longer server draft and does not add a copy", async () => {
+	const local = new TextEncoder().encode("Видели когда-нибудь System Design ");
+	const server = new TextEncoder().encode("Видели когда-нибудь воркшоп по System Design про ML");
+	const writes: string[] = [];
+	const io = fake({
+		read: async () => local,
+		get: async () => ({ body: server, etag: "server" }),
+		put: async () => {
+			throw new Error("uploaded a copy");
+		},
+		write: async (path) => {
+			writes.push(path);
+			return { size: server.length, mtime: 9 };
+		},
+	});
+	const result = await execute([{ type: "conflict", path: "note.md", etag: "server" }], io, {
+		"note.md": { size: local.length, mtime: 1, etag: "old" },
+	});
+	assert.deepEqual(writes, ["note.md"]);
+	assert.deepEqual(result.conflicts, []);
+	assert.equal(result.baseline["note.md"].etag, "server");
+	assert.deepEqual(result.errors, []);
+});
+
+test("a conflict keeps both sides when the local note shrank", async () => {
+	const local = new TextEncoder().encode("hello\n");
+	const server = new TextEncoder().encode("hello world\n");
+	const writes: string[] = [];
+	const io = fake({
+		read: async () => local,
+		get: async () => ({ body: server, etag: "server" }),
+		put: async (path) => {
+			assert.equal(path, "note (conflict).md");
+			return { etag: "copy" };
+		},
+		write: async (path) => {
+			writes.push(path);
+			return { size: 1, mtime: 9 };
+		},
+		stat: async (path) => {
+			if (path.includes("conflict")) throw new Error("missing");
+			return { size: 1, mtime: 1 };
+		},
+	});
+	const result = await execute([{ type: "conflict", path: "note.md", etag: "server" }], io, {
+		"note.md": { size: server.length, mtime: 1, etag: "old" },
+	});
+	assert.deepEqual(writes, ["note (conflict).md", "note.md"]);
+	assert.deepEqual(result.conflicts, ["note (conflict).md"]);
+});
+
+test("an open editor takes the incoming text only when it is an older draft", () => {
+	const older = new TextEncoder().encode("System Design ");
+	const incoming = new TextEncoder().encode("воркшоп по System Design ");
+	const ahead = new TextEncoder().encode("воркшоп по System Design про ML");
+	assert.equal(incomingReplacesEditor(older, incoming), true);
+	assert.equal(incomingReplacesEditor(incoming, incoming), false);
+	assert.equal(incomingReplacesEditor(ahead, incoming), false);
 });
 
 test("a conflict keeps the local edit beside the newer server file", async () => {
