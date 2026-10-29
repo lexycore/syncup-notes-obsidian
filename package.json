@@ -2,7 +2,7 @@
 	"name": "syncup-notes",
 	"private": true,
 	"type": "module",
-	"version": "0.2.10",
+	"version": "0.2.11",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
